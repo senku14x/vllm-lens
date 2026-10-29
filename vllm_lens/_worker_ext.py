@@ -1069,6 +1069,7 @@ def _hook_inner(
             req_id: str,
             start: int,
             end: int,
+            abs_start: int = 0,
         ) -> None:
             """Run the post-hooks in one category list at this layer.
 
@@ -1085,6 +1086,7 @@ def _hook_inner(
                     ctxs[pos] = ctx
                 ctx.layer_idx = layer_idx
                 ctx.seq_len = end - start
+                ctx.abs_start = abs_start
                 ctx.model = _runner_model(runner)
                 ctx._prefetched = extension._prefetched_params
 
@@ -1103,14 +1105,16 @@ def _hook_inner(
             start, end = qsl[i], qsl[i + 1]
             # Persistent hooks fire first (base layer); per-request hooks
             # see the persistent-modified state.
+            a0 = plan.abs_start[i]  # 018 patch: absolute start of this request's rows
             _run_post_category(
                 persistent_hooks,
                 extension._persistent_hook_contexts,
                 req_id,
                 start,
                 end,
+                a0,
             )
-            _run_post_category(rp.hooks, extension._hook_contexts, req_id, start, end)
+            _run_post_category(rp.hooks, extension._hook_contexts, req_id, start, end, a0)
 
     # --- Phase 3: capture activations (rank 0 only) -----------------
     if cap_rows:

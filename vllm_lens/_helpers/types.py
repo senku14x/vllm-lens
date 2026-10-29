@@ -115,11 +115,12 @@ class HookContext:
     each call.
     """
 
-    __slots__ = ("layer_idx", "seq_len", "saved", "model", "_prefetched")
+    __slots__ = ("layer_idx", "seq_len", "abs_start", "saved", "model", "_prefetched")
 
     def __init__(self) -> None:
         self.layer_idx: int = 0
         self.seq_len: int = 0
+        self.abs_start: int = 0  # 018 patch: absolute position of this slice's first row in the request
         self.saved: dict[str, Any] = {}
         self.model: Any = None
         self._prefetched: dict[str, torch.Tensor] = {}
