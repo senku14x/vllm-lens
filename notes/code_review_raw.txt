@@ -1,0 +1,618 @@
+{
+  "summary": "Independent review of the vllm-lens hot-path/Qwen3.6 fix against upstream semantics and vLLM 0.30 internals",
+  "agentCount": 10,
+  "logs": [],
+  "result": [
+    {
+      "key": "steering",
+      "findings": [
+        {
+          "title": "norm_match fast path computes L2 norms over a stacked (k, hidden) batch, so on CUDA its reduction order differs from upstream's per-token norms. Results are not bit-identical and depend on how many other steered rows share the pass.",
+          "severity": "minor",
+          "file": "/root/vllm-lens-fixed/vllm_lens/_worker_ext.py",
+          "line": 849,
+          "scenario": "A model served in fp16 or fp32 (bf16 is rarely affected) gets norm_match=True steering at a layer in a pass where the fast path collects k>1 vector rows. Two cases produce this: several requests in one decode step with 2-D vectors, or one prefill chunk where a 3-D vector touches several positions. Upstream computed `residual.float().norm(dim=-1, keepdim=True)` on one row at a time: `norm_ref[start:end]` of shape (1,H) for 2-D, `norm_ref[rel]` of shape (H,) for 3-D. The new code computes `ref.float().norm(dim=-1, keepdim=True)` and `v.float().norm(...)` on stacked (k,H) tensors. On CUDA a norm with 1 output and a norm with k outputs pick different block shapes, so the fp32 sum of squares is added in a different order. The fp32 norm ratio can then differ by an ulp, and rounding `matched` to the model dtype can flip elements of the steering vector. The steered output then differs from upstream eager, and request A's result also depends on how many other norm-matched rows are in the batch, which upstream does not have. The docstring claim 'the arithmetic per element is the same multiply and add as _apply_steering' does not hold for norm_match.",
+          "evidence": "New fast path (lines 849-853): `ref = _norm_ref_rows(target, base, idx)` (k,H); `r_norm = ref.float().norm(dim=-1, keepdim=True)`; `v_norm = v.float().norm(dim=-1, keepdim=True)`. Upstream `_apply_steering` calls `norm_match(norm_ref[start:end], v)` / `norm_match(norm_ref[rel], v)` once per token. torch 2.13 ATen/native/cuda/Reduce.cuh:100-108 `set_block_dimension`: `block_height = min(dim1_pow2, max_threads/block_width); block_width = min(dim0_pow2, max_threads/block_height)`. With 1 output this gives a 512-wide block; with k outputs the width is 512/min(pow2(k),16), so the summation tree is different. CPU experiment (/tmp/claude-0/-workspace/f7b8273c-d00a-47da-b423-a819fa789abb/scratchpad/review/norm_order.py), simulating 512-lane vs 128-lane fp32 accumulation on H=4096: the norm differs in 677/2000 vectors. A 1-ulp change in the fp32 ratio changes the rounded steering vector in 2/500 bf16, 52/500 fp16 and 500/500 fp32 vectors. On CPU, where reduction order does not depend on shape, the new `_hook_inner` matched upstream's `_hook_inner` (given correct abs_start) bit for bit: 150 random cases x {bf16 H=64, bf16 H=4096, fp16 H=4096, fp32 H=512}, 542 steered layer-passes each, 0 diffs (/tmp/claude-0/-workspace/f7b8273c-d00a-47da-b423-a819fa789abb/scratchpad/review/steer_diff.py). So scale dtype, norm_ref choice for tuple and plain outputs, index_add_ vs slice add, duplicate positions, multi-config ordering, 2-D vectors over multi-token chunks and the per-layer skip are all equivalent. Only the GPU reduction shape breaks bit-equality.",
+          "suggested_fix": "For norm-matched entries, compute the norm one row at a time with upstream's shapes, e.g. loop `norm_match(ref_rows[j:j+1], v[j:j+1])` (or `norm_ref[rel]` for 3-D) before stacking. Alternatively, send any row that has a norm_match config down the sequential `_apply_steering` path and keep index_add_ only for plain vectors. If neither is acceptable, drop the bit-equivalence claim from the docstring and document that norm_match steering may differ in the last ulp."
+        },
+        {
+          "title": "abs_start from input_batch.num_computed_tokens_cpu is optimistic under async scheduling + speculative decoding, so 3-D steering on generated positions is off by the number of rejected drafts",
+          "severity": "minor",
+          "file": "/root/vllm-lens-fixed/vllm_lens/_worker_ext.py",
+          "line": 510,
+          "scenario": "Setup: speculative decoding with EAGLE, MTP, draft_model or ngram-gpu, where vLLM 0.30 turns async scheduling on by default. Under async spec decode the CPU `num_computed_tokens_cpu` assumes every previous draft was accepted. The real positions are corrected only on the GPU, and the CPU copy is fixed only after the forward has been launched. In a decode step right after a step that rejected r drafts, the hooks' `abs_start[i]` is r too large. So a 3-D SteeringVector whose position_indices fall in the generated region is applied to the wrong tokens or skipped. The plan filter `rp.steer_max_pos >= a0 and rp.steer_min_pos < a0 + n` (line 528) also uses this a0, so it can drop the row, which can let the pass replay a CUDA graph with no steering. The code comment at lines 508-509, 'the runner builds them from the same buffer', is false in this mode. Prefill chunks and 2-D broadcast vectors are unaffected.",
+          "evidence": "vllm/v1/worker/gpu_model_runner.py:1398-1406: 'Optimistically assume all accepted; queue up a correction to be called after the model forward ... Corrected on GPU in _prepare_inputs.' Lines 2163-2199: when `use_async_spec_decode`, the GPU `self.num_computed_tokens` is corrected with `update_num_computed_tokens_for_batch_change(...)`, then `self.positions[:T] = self.num_computed_tokens[req_indices_gpu] + query_pos`, so the forward's positions come from the corrected GPU copy, not the CPU array. Lines 4543-4546: `deferred_state_corrections_fn()` (which does `num_computed_tokens_cpu[cur_req_index] -= correction`, line 1576) runs only after the batch is launched. Line 716: `use_async_spec_decode = use_async_scheduling and num_spec_tokens > 0`. vllm/config/vllm.py:1438-1487 enables async scheduling by default with EAGLE/MTP/draft_model/ngram-gpu spec decoding. New code at line 510: `abs_start = batch.num_computed_tokens_cpu[:num_reqs].tolist()`.",
+          "suggested_fix": "When `runner.use_async_spec_decode` is true, read positions from what the forward actually uses. Options: take abs_start per row from the GPU positions (`runner.positions[qsl[i]]`, which costs one sync per active pass), or adjust by the pending correction (`req_state.prev_num_draft_len` minus the accepted count once known). Failing that, mark rows with 3-D vectors as needing a GPU-side position lookup, or raise/warn when 3-D steering is combined with async spec decode. At minimum, fix the comment at lines 508-509."
+        }
+      ],
+      "verdicts": [
+        {
+          "title": "norm_match fast path computes L2 norms over a stacked (k, hidden) batch, so on CUDA its reduction order differs from upstream's per-token norms. Results are not bit-identical and depend on how many other steered rows share the pass.",
+          "real": true,
+          "severity": "minor",
+          "reasoning": "Confirmed. In _steer_layer (/root/vllm-lens-fixed/vllm_lens/_worker_ext.py:849-853) the fast path takes `ref.float().norm(dim=-1, keepdim=True)` and `v.float().norm(...)` over stacked (k,H) tensors. Upstream's _apply_steering called norm_match one row at a time: (1,H) for 2-D decode, (H,) for 3-D. The fixed code still sends 2-D vectors over multi-token chunks down the sequential path, so k>1 only happens for (a) several norm-matched requests in one decode step or (b) a 3-D vector touching several positions in one chunk, which is what the finding says. In the installed torch 2.13 header (torch/include/ATen/native/cuda/Reduce.cuh:100-108 and setReduceConfig ~1105-1129), an inner-dim fp32 reduction with H=4096 is vectorized by 4 (dim0=1024, so dim0_pow2=512). block_height = min(last_pow2(num_outputs), 16) and block_width = 512/block_height. So 1 output uses 512 lanes, 2 outputs use 256, 4 use 128, and so on. The per-thread strides and the lane-tree reduction change, so the fp32 sum of squares adds in a different order. My own crude CPU emulation of 512 vs 256 lanes (scratchpad/review/norm_order2.py) gave a different fp32 norm in 89 of 1000 random 4096-dim vectors. That is enough to sometimes flip rounded bf16/fp16 elements, and essentially always change fp32 ones. The rest of the fast path matches upstream: index_add_ with unique indices, the same opmath for scale and the same promotion. The only divergence is the reduction shape, and it is ulp-level, so the severity is minor. It is still a real departure from the stated bit-identical-to-upstream standard, and from the docstring's 'same arithmetic' claim.",
+          "suggested_fix": "For rows whose config has norm_match, compute norms with upstream's shapes: loop norm_match(ref[j:j+1], v[j:j+1]) per row (or ref[j] for 3-D entries) and stack the results before index_add_. Alternatively, route any row with a norm_match config through the sequential _apply_steering path and keep the batched index_add_ only for plain vectors. If neither is wanted, change the docstring to say norm_match steering may differ from upstream in the last ulp on GPU."
+        },
+        {
+          "title": "abs_start from input_batch.num_computed_tokens_cpu is optimistic under async scheduling + speculative decoding, so 3-D steering on generated positions is off by the number of rejected drafts",
+          "real": true,
+          "severity": "minor",
+          "reasoning": "Confirmed against vLLM 0.30 source. The plan is built inside the wrapped _determine_batch_execution_and_padding (_worker_ext.py:614-618 -> _current_plan -> _build_step_plan, line 510 abs_start = batch.num_computed_tokens_cpu[:num_reqs]). In execute_model that call (gpu_model_runner.py:4288) runs after _update_states/_prepare_inputs but before the forward. Under use_async_spec_decode (line 716: async scheduling plus num_spec_tokens>0), _update_states stores the scheduler's optimistic num_computed_tokens, which assumes all previous drafts were accepted, and queues a correction (lines 1398-1406). _prepare_inputs fixes only the GPU copy, via update_num_computed_tokens_for_batch_change (lines 2160-2181), and builds the forward's positions from that GPU copy (lines 2193-2196). The CPU num_computed_tokens_cpu is corrected by deferred_state_corrections_fn (line 1576), which runs at line 4545 after the forward launches, or at 4344 in mamba align mode, which is still after the determine call. So at step t the hooks' abs_start is too large by the number of drafts rejected at step t-1. A position-specific vector at generated position p lands on actual position p-r or is skipped. The plan filter at line 528 uses the same a0 and can drop the row, which lets the pass replay a CUDA graph with no steering. vllm/config/vllm.py:1438-1487 turns async scheduling on by default for EAGLE/MTP/draft_model/ngram-gpu/dspark spec decoding, and the plugin does nothing about spec decode or async scheduling (grep finds no handling). The comment at lines 508-509 is false in this mode. Upstream was worse here (abs_start=0 always), so this is an incomplete fix rather than a regression. It needs spec decode plus 3-D steering on generated positions, hence minor.",
+          "suggested_fix": "When runner.use_async_spec_decode is true, either derive abs_start from the positions the forward actually uses (for example read runner.positions[qsl[i]] for rows with 3-D steering, at the cost of one sync on such passes), or warn/raise when 3-D position-specific steering is combined with async spec decode (or disable async scheduling in the plugin's config hook when spec decode is configured). At minimum, correct the comment at lines 508-509 and document the limitation."
+        }
+      ]
+    },
+    {
+      "key": "lifecycle",
+      "findings": [
+        {
+          "title": "Hooked passes never get force_eager: _current_plan returns None in the dispatch wrapper because no forward context exists yet, so decode steps replay CUDA graphs and every hook is silently skipped",
+          "severity": "critical",
+          "file": "/root/vllm-lens-fixed/vllm_lens/_worker_ext.py",
+          "line": 576,
+          "scenario": "Default config (VLLM_LENS_CUDA_GRAPHS unset, so cudagraph_mode=FULL_DECODE_ONLY). Take any request with decode-time work: output_residual_stream, a 2-D steering vector, a 3-D vector at a generated position, a post-hook or pre-hook, output_qk, or persistent hooks. On each uniform-decode pass with num_tokens <= max_cudagraph_capture_size, the determine() wrapper calls _current_plan(). _step_plan was just reset to None, and is_forward_context_available() is False because vLLM only enters set_forward_context after dispatch. So _current_plan returns None, force_eager is never set, the dispatcher returns FULL, and CUDAGraphWrapper replays the captured graph. No Python forward hook or pre-hook runs on that pass. Prefill and mixed batches still run eagerly, so hooks run there and the failure looks partial: the prompt gets steered and captured, the generated tokens do not.",
+          "evidence": "_current_plan (lines 571-579): `plan = extension._step_plan` is None at determine time (execute_model sets `extension._step_plan = None`, line 601), then `if not is_forward_context_available(): return None`. vLLM 0.30 gpu_model_runner.execute_model calls `self._determine_batch_execution_and_padding(...)` at line 4288 and only enters `set_forward_context(...)` at line 4446. forward_context.py:208-209 `is_forward_context_available(): return _forward_context is not None`. Nothing in gpu_worker.execute_model (lines 1149-1210) sets a context either. Dispatcher (cudagraph_dispatcher.py:274-281) returns NONE only if `allowed_modes <= {NONE}`, which needs force_eager. CUDAGraphWrapper.__call__ (cuda_graph.py:242-256) runs the module eagerly only when the runtime mode is NONE; otherwise it replays. CPU experiment (/tmp/claude-0/-workspace/f7b8273c-d00a-47da-b423-a819fa789abb/scratchpad/review/dispatch_exp.py) uses the real _install_runner_wrappers/_current_plan with a fake runner that keeps vLLM's call order (determine before forward context). Output: `seen: [('determine', False, False), ('forward', 'FULL', True)]`, `stats: {... 'passes_active': 1, 'passes_forced_eager': 0 ...}`. The pass is active but dispatched FULL. The new GPU tests TestCudaGraphs.test_graphs_on_and_only_hooked_passes_eager (`passes_forced_eager >= 15`) and TestDecodePositions.test_vector_at_generated_position_is_applied should fail against this code.",
+          "suggested_fix": "Do not require a forward context to build the plan when the runner has the host mirror. Only the attn-metadata fallback in _host_query_start_loc needs one. Check `getattr(getattr(runner,'query_start_loc',None),'np',None) is not None or is_forward_context_available()` instead. The plan is then built in determine(), after _prepare_inputs has filled query_start_loc.np, and reused by every hook in the pass via plan.step. Make determine() fail-safe: wrap _current_plan in try/except. On error, log and set force_eager=True. That way a plan-building exception never escapes execute_model and kills the engine, and never lets a pass with unknown hook work replay a graph. (Example of such an exception: `frozenset(value)` in _parse_layer_request raises TypeError for output_residual_stream=[[0]].) Also add a CPU unit test that reproduces vLLM's call order, plus an assertion that passes_forced_eager equals passes_active on decode."
+        },
+        {
+          "title": "Absolute steering positions come from the optimistic num_computed_tokens_cpu under async scheduling with speculative decoding (EAGLE/MTP/draft model), so 3-D vectors shift by the number of rejected drafts",
+          "severity": "minor",
+          "file": "/root/vllm-lens-fixed/vllm_lens/_worker_ext.py",
+          "line": 510,
+          "scenario": "Speculative decoding with EAGLE/MTP/draft_model, where vLLM 0.30 turns async scheduling on by default (config/vllm.py:1438-1487). The previous step proposed k drafts and only a < k were accepted. In the current step, _update_states writes the scheduler's optimistic num_computed_tokens (all k accepted) into input_batch.num_computed_tokens_cpu and defers the correction. The GPU positions the model actually uses are corrected on device. The plan's abs_start is therefore k - a positions too high. A 3-D steering vector at absolute position P during decode lands on the token at true position P - (k - a), or the steer-window prefilter (line 527-528) drops the request from plan.steer. With mamba_cache_mode='align', the correction is applied before preprocess_mamba but after determine, so a plan built in determine (the intended design) would also be stale.",
+          "evidence": "gpu_model_runner.py:1381-1406: 'Optimistically assume all accepted; queue up a correction to be called after the model forward ... Corrected on GPU in _prepare_inputs'. Line 1491: `num_computed_tokens_cpu[req_index] = num_computed_tokens` (optimistic). Correction closure at 1556-1583 runs at line 4545 (after the forward), or at 4344 in align mode. Positions: lines 2165-2180 update_num_computed_tokens_for_batch_change fixes self.num_computed_tokens on GPU, and line 2195 `self.positions = self.num_computed_tokens[req_indices_gpu] + query_pos`. Plan: `abs_start = batch.num_computed_tokens_cpu[:num_reqs].tolist()` (line 510), with the comment 'the runner builds them from the same buffer', which does not hold in this mode.",
+          "suggested_fix": "When runner.use_async_spec_decode is true, get the true starts from a source that includes the correction: read back runner.num_computed_tokens[:num_reqs] (one small D2H, only on passes with position-specific steering), or derive the start from runner.positions for the row's first token. Otherwise, document that position-specific decode steering is unsupported with async spec decode and warn when such a request is seen. Note that the window prefilter in _build_step_plan has the same dependency."
+        },
+        {
+          "title": "Forced-eager passes still use full-CUDA-graph FlashAttention settings (num_splits=32), so results on Hopper/FA3 can differ numerically from upstream's eager engine",
+          "severity": "minor",
+          "file": "/root/vllm-lens-fixed/vllm_lens/_activations_plugin.py",
+          "line": 395,
+          "scenario": "H200/H100 (FA3, aot_schedule=True), default plugin config with cudagraph_mode=FULL_DECODE_ONLY. A steered or captured request's passes are forced eager (once finding 1 is fixed). The attention metadata builder decides max_num_splits from the configured cudagraph mode, not from the pass's runtime mode. Every pass with num_actual_tokens <= max_cudagraph_capture_size (decode steps and small prefills, including forced-eager ones) therefore uses num_splits=32. Upstream used enforce_eager, which gives cudagraph_mode NONE and num_splits=0 (FA3's heuristic). A different split-KV reduction gives slightly different bf16 attention outputs, so captured activations and greedy tokens are not guaranteed to match upstream eager bit for bit. That breaks the stated 'identical to upstream eager' standard; the new test asserts torch.equal(acts, racts). The effect is more likely with longer contexts, where FA3's split choice differs. Not verified on GPU per the rules, so treat as plausible.",
+          "evidence": "vllm/v1/attention/backends/flash_attn.py:696-697 `self.use_full_cuda_graph = self.compilation_config.cudagraph_mode.has_full_cudagraphs()`. Lines 701-720 set `self.max_num_splits = attention_config.flash_attn_max_num_splits_for_cuda_graph` (config/attention.py:61, default 32) when aot_schedule (FA3). Lines 805-815: `max_num_splits = 0 ... if self.use_full_cuda_graph and ... num_actual_tokens <= self.max_cudagraph_size: max_num_splits = self.max_num_splits`, independent of forward_context.cudagraph_runtime_mode. With enforce_eager, config/vllm.py:1546-1552 sets cudagraph_mode=NONE, so upstream always passed num_splits=0. The GPU here is an NVIDIA H200 (compute 9.0), i.e. FA3.",
+          "suggested_fix": "Document that graph mode is only numerically equivalent, not bitwise, to the eager engine, and relax the torch.equal parity test to a tolerance. Alternatively, set attention_config.flash_attn_max_num_splits_for_cuda_graph=0 or VLLM_BATCH_INVARIANT-style splits so eager-forced passes keep the heuristic, and verify that the parity test (graph engine vs VLLM_LENS_CUDA_GRAPHS=0) passes with long prompts (>1k tokens), not just the 12-token prompt used now."
+        },
+        {
+          "title": "An error while building the per-pass plan (e.g. a malformed output_residual_stream) disables hooks for every request in the batch, not just the bad one",
+          "severity": "minor",
+          "file": "/root/vllm-lens-fixed/vllm_lens/_worker_ext.py",
+          "line": 346,
+          "scenario": "One request sends output_residual_stream=[[0, 1]] (or any list containing an unhashable item, e.g. via vllm_xargs JSON). _parse_layer_request runs `frozenset(value)`, which raises TypeError inside _build_step_plan. In the current code the plan is built lazily in the first layer hook. The exception is caught and logged by the hook wrapper, _step_plan stays None, and every later layer hook rebuilds and fails again. So every co-batched request loses steering, capture and hooks on every pass while the bad request is in the batch. Upstream evaluated `layer_idx not in output_residual_stream`, which never raises, so only that request got no capture. Once finding 1 is fixed by building the plan in determine(), the same exception would escape execute_model and crash the engine unless it is caught.",
+          "evidence": "_parse_layer_request: `if isinstance(value, list): return True, frozenset(value)`. Upstream (/root/vllm-lens-upstream/vllm_lens/_worker_ext.py:575-579): `isinstance(output_residual_stream, list) and layer_idx not in output_residual_stream`. _build_step_plan is called from _current_plan with no exception isolation per request.",
+          "suggested_fix": "Resolve requests in isolation: wrap _resolve_request per request in try/except. On failure, log once per request id, cache an idle _ReqPlan for it, and keep planning the rest of the batch. Validate or normalise output_residual_stream/output_qk (ints only) in _parse_layer_request instead of raising. In determine(), catch any remaining exception and force eager (see finding 1)."
+        }
+      ],
+      "verdicts": [
+        {
+          "title": "Hooked passes never get force_eager: _current_plan returns None in the dispatch wrapper because no forward context exists yet",
+          "real": false,
+          "severity": "critical",
+          "reasoning": "This was true of an earlier version of the file. It is not true of the working copy now (/root/vllm-lens-fixed/vllm_lens/_worker_ext.py, modified 20:11). _current_plan (lines 565-583) no longer checks is_forward_context_available(). The code now says 'No forward-context requirement: the dispatch wrapper plans the pass before vLLM sets the context'. It returns None only when not in execute_model or while a CUDA graph is being captured. _host_query_start_loc only needs a forward context on its fallback path, when runner.query_start_loc.np is missing. In vLLM 0.30 that mirror exists and _prepare_inputs fills it (gpu_model_runner.py:2080-2085) before _determine_batch_execution_and_padding runs (line 4288). I reran the reviewer's own experiment (/tmp/claude-0/-workspace/f7b8273c-d00a-47da-b423-a819fa789abb/scratchpad/review/dispatch_exp.py) against the current code. It printed seen: [('determine', True, False), ('forward', 'NONE', True)] and stats passes_active=1, passes_forced_eager=1. The pass is planned in determine(), force_eager is set, the dispatcher returns NONE, and the forward reuses the same plan (plan.step == _exec_step). The one remaining point from this finding is the lack of a try/except in determine(), which is covered under finding 4.",
+          "suggested_fix": "None needed for the dispatch logic. Optionally add a CPU unit test that calls determine before the forward context exists, as the experiment does, and asserts passes_forced_eager == passes_active."
+        },
+        {
+          "title": "Absolute steering positions come from the optimistic num_computed_tokens_cpu under async scheduling with speculative decoding, so 3-D vectors shift by the number of rejected drafts",
+          "real": true,
+          "severity": "minor",
+          "reasoning": "Confirmed in vLLM 0.30. config/vllm.py:1438-1487 turns async_scheduling on by default for EAGLE/MTP/draft_model/ngram-GPU spec decode, and the plugin does not change that. With async spec decode, _update_states writes the scheduler's optimistic count, which assumes every draft was accepted, into input_batch.num_computed_tokens_cpu (gpu_model_runner.py:1381-1406, 1491). The CPU correction (correct_spec_decode_token_counts, 1556-1583) runs only after the forward (line 4545), or at line 4344 in mamba align mode, which is still after determine(). _prepare_inputs corrects only the GPU copy (update_num_computed_tokens_for_batch_change, 2165-2186), and positions are built from that GPU copy (line 2195). So during the forward, the plan's abs_start = batch.num_computed_tokens_cpu (line 510) is too high by the number of drafts rejected in the previous step. The comment 'the runner builds them from the same buffer' does not hold in this mode. A 3-D vector at a generated position then hits the wrong token, or the window check at lines 525-529 drops the row. This needs spec decode plus position-specific decode steering, so it is niche, but it is a gap in fix #1.",
+          "suggested_fix": "When runner.use_async_spec_decode is true and the plan has position-specific (3-D) steering rows, read the corrected starts from runner.num_computed_tokens[:num_reqs]. That is one small D2H copy, needed only on such passes. Alternatively, read each row's first position from runner.positions. Otherwise, document the limitation and log a warning once when 3-D steering is used with async spec decode. The window check in _build_step_plan has the same dependency."
+        },
+        {
+          "title": "Forced-eager passes still use full-CUDA-graph FlashAttention settings (num_splits=32), so results on Hopper/FA3 can differ numerically from upstream's eager engine",
+          "real": false,
+          "severity": "minor",
+          "reasoning": "The configuration difference is real. FlashAttentionMetadataBuilder sets use_full_cuda_graph from the configured cudagraph_mode (flash_attn.py:696-697), not from the pass's runtime mode. With FA3, aot_schedule sets max_num_splits=32 (lines 717-720), and any pass with num_actual_tokens <= max_cudagraph_capture_size gets num_splits=32 even when forced eager (805-815). Upstream used enforce_eager, so cudagraph_mode was NONE and num_splits was 0 (the heuristic). What I could not confirm is that this changes the numbers. FA3 bounds per-batch splits dynamically, using min(static splits, the split count implied by blocks per SM). In many single-request and uniform-length decode cases that gives the same split count either way. A difference is plausible mainly for mixed-length batched decode, where the heuristic picks 1 split. The existing parity test (12-token prompt, 12 tokens generated) cannot show it either way. Checking it needs a GPU run, which the rules forbid. Following 'default to false when uncertain', I am marking this not confirmed. The suggested fix of setting flash_attn_max_num_splits_for_cuda_graph=0 is unsafe: vLLM documents 0 as 'not CG compatible' for the graph-replayed passes.",
+          "suggested_fix": "No code change. When the GPU is free, run the graph-vs-eager parity test with a batch of mixed-length, long-context prompts (>1k tokens). If it diverges, document that graph mode matches eager numerically but not bit for bit on FA3, and compare with a tolerance."
+        },
+        {
+          "title": "An error while building the per-pass plan (e.g. a malformed output_residual_stream) disables hooks for every request in the batch, not just the bad one",
+          "real": true,
+          "severity": "major",
+          "reasoning": "Confirmed, and with the current code it is worse than the finding says. The plan is now built in the determine() wrapper (lines 614-620), which has no try/except, outside the hooks' error handling. _parse_layer_request does frozenset(value) (line 346), which raises TypeError for any list holding an unhashable item. The string '[[0, 1]]' via vllm_xargs reaches it because the function json.loads string values first. Nothing upstream of the worker validates this field: _activations_plugin only checks `is not None`. CPU experiment (/tmp/claude-0/-workspace/f7b8273c-d00a-47da-b423-a819fa789abb/scratchpad/review/v_malformed_cap.py, output in v_malformed_cap.out) with extra_args output_residual_stream='[[0, 1]]': the TypeError ('unhashable type: list') escapes determine -> _current_plan -> _build_step_plan -> _resolve_request -> _parse_layer_request, and so escapes runner.execute_model. EngineCore.log_error_detail re-raises (v1/engine/core.py:498-512), which leads to 'EngineCore encountered a fatal error' and ENGINE_CORE_DEAD. So one malformed request kills the whole server. Upstream did `layer_idx not in output_residual_stream`, which never raises.",
+          "suggested_fix": "In _parse_layer_request, keep only int-like entries and do not raise: try frozenset(int(x) for x in value if isinstance(x, (int, str)) and str(x).lstrip('-').isdigit()), and on failure treat the value as requested-but-empty or log once. Wrap _resolve_request for each request in _build_step_plan in try/except. On error, log once per req_id and cache an idle _ReqPlan so the rest of the batch keeps its hooks. In the determine() wrapper, wrap _current_plan in try/except. On error, log it, set force_eager=True, and still call orig_determine, so a planning bug can never kill the engine or let a hooked pass replay a graph."
+        }
+      ]
+    },
+    {
+      "key": "capture",
+      "findings": [
+        {
+          "title": "The forced-eager routing never fires, so decode steps of capturing requests replay a CUDA graph and their activations are silently dropped",
+          "severity": "critical",
+          "file": "/root/vllm-lens-fixed/vllm_lens/_worker_ext.py",
+          "line": 576,
+          "scenario": "Default config (VLLM_LENS_CUDA_GRAPHS unset, so cudagraph_mode=FULL_DECODE_ONLY). A request sets output_residual_stream=True and generates N tokens. Every decode-only pass is a uniform decode, and the dispatcher picks FULL graph replay because nothing passes force_eager. The decoder-layer hooks never run in those passes, so no rows are captured for generated tokens (Q/K, steering and hooks are skipped the same way). The returned residual_stream has n_prompt rows plus rows only from decode steps that happened to be co-scheduled with a prefill. _trim_activations only trims tensors that are too long, so the short, irregular tensor reaches the client with no error, and the client cannot tell which positions are missing.",
+          "evidence": "The determine wrapper (lines 613-619) calls _current_plan(), and _current_plan has `if not is_forward_context_available(): return None` (line 576). In vLLM 0.30 execute_model, `self._determine_batch_execution_and_padding(...)` runs at gpu_model_runner.py:4288, but `set_forward_context(...)` is entered only at :4446. forward_context.py:208 `is_forward_context_available()` is `_forward_context is not None`, and nothing sets it earlier (grep finds no other writer). So at determine time plan is None, `plan.active` is never checked and force_eager stays False. CPU experiment (scratchpad/review/exp_determine.py): a fake runner that follows vLLM's order (prepare qsl, determine, then forward context) with a capturing decode request printed `force_eager seen by vLLM: [False] -> mode FULL`, stats `passes_planned: 0, passes_forced_eager: 0`. CUDAGraphWrapper (compilation/cuda_graph.py ~243-265) replays without calling the model's Python forward, so the hooks are bypassed.",
+          "suggested_fix": "Build the plan in the determine wrapper without requiring a forward context. _build_step_plan only reads host state (input_batch, query_start_loc.np, num_computed_tokens_cpu), all of which _update_states/_prepare_inputs have filled before line 4288. Move the is_forward_context_available() check into the attn-metadata fallback in _host_query_start_loc only. Wrap the plan build inside determine in try/except, setting force_eager=True on error, so a bad request cannot raise into execute_model. Add a unit/GPU test that asserts lens_stats()['passes_forced_eager'] > 0 and that the captured residual_stream length equals n_prompt + n_gen - 1 with CUDA graphs on."
+        },
+        {
+          "title": "Pinned capture blocks are shared per pass and power-of-two rounded, so retrieved or aborted requests' activations stay page-locked",
+          "severity": "major",
+          "file": "/root/vllm-lens-fixed/vllm_lens/_worker_ext.py",
+          "line": 1697,
+          "scenario": "Async server with capture under continuous batching. Request A (long prompt, all layers captured) and request B (short prompt, long generation, captured) share prefill passes. Each pass and layer gets one pinned block holding both A's and B's rows, and _flush_capture_blocks files per-request *views* (`block.host[offset:offset+n]`) into _captured_states. When A finishes, get_captured_states pops A, or when A is aborted, clear_captured_states deletes A. B's views still pin every shared block, so all of A's rows stay resident until B is retrieved. Long-lived requests chain this across many passes. Separately, each block comes from torch's CachingHostAllocator, which by default rounds every pinned allocation up to the next power of two (up to ~2x; e.g. a 2048x5120 bf16 chunk of 21 MB becomes 32 MB) and never returns freed blocks to the OS. Peak capture memory therefore stays page-locked, non-swappable host RAM for the life of the worker. In the offline path none of the L x passes blocks is freed before the final batch get, so each one costs a fresh cudaHostAlloc. Pinning is also unconditional, ignoring vLLM's is_pin_memory_available() (False on some WSL setups). Upstream did a per-request `.cpu()` into exact-size pageable memory that was freed on pop.",
+          "evidence": "_capture_layer lines 948-951: `host = torch.empty(sel.shape, dtype=sel.dtype, pin_memory=True); host.copy_(sel, non_blocking=True)`, one block for all capturing rows of the pass. _flush_capture_blocks lines 1697-1699 appends `block.host[offset : offset + n]` (a view). CPU experiment (scratchpad/review/exp_capture.py): requests '0-big' (1000 tokens) and '1-small' (2 tokens) in one pass, then get_captured_states_batch(['0']) and clear_captured_states('0'). Output: `small request's own captured bytes=160, storage bytes kept alive=80160 (501x)`. torch/include/ATen/core/CachingHostAllocator.h:300-306 `return c10::llvm::PowerOf2Ceil(size)`, with defaults pinned_max_round_threshold_ and pinned_max_cached_size_ = SIZE_MAX (c10/core/AllocatorConfig.h:361-363). vLLM platforms/interface.py:1015 is_pin_memory_available() returns False under WSL.",
+          "suggested_fix": "When filing blocks, copy each segment out of the pinned block into its own pageable tensor (`block.host[o:o+n].clone()` after event.synchronize()), or concatenate per request once, then drop the block. Better still, recycle a small pool of pinned staging buffers (sized per pass) so pinned memory stays bounded and is not re-allocated per layer per pass. Flush at the end of each execute_model, or when the pending-block bytes pass a threshold, rather than only on retrieval RPCs. Fall back to a synchronous `.cpu()` when vllm.utils.platform_utils.is_pin_memory_available() is False."
+        },
+        {
+          "title": "Malformed output_residual_stream from one request breaks the whole batch's plan (and would crash the engine once the plan is built in the determine wrapper)",
+          "severity": "minor",
+          "file": "/root/vllm-lens-fixed/vllm_lens/_worker_ext.py",
+          "line": 346,
+          "scenario": "An HTTP client sends vllm_xargs output_residual_stream='[[1,2]]' (or any list with an unhashable element). _parse_layer_request runs frozenset([[1,2]]) and raises TypeError inside _resolve_request, then _build_step_plan, then _current_plan. That happens in the first hook of every pass, so every co-batched request loses capture, steering, hooks and Q/K for as long as this request is in the batch; the error only appears in the rate-limited hook-error log. Upstream never raised here: `layer_idx not in [[1,2]]` just skipped that one request. If the critical forced-eager bug is fixed by building the plan in the determine wrapper (which has no try/except), the same TypeError would propagate into vLLM's execute_model and kill the engine.",
+          "evidence": "Line 346: `if isinstance(value, list): return True, frozenset(value)`. _build_step_plan resolves every row (lines 515-521) with no per-request error isolation. The determine wrapper (lines 613-619) calls _current_plan without try/except.",
+          "suggested_fix": "In _parse_layer_request, keep only int-convertible entries (e.g. `frozenset(int(x) for x in value if isinstance(x, (int, float)))`) or catch TypeError and treat the value as 'no layers'. Wrap _resolve_request per request in try/except, logging and treating that row as idle, so one bad request cannot disable the batch or crash execute_model."
+        },
+        {
+          "title": "On non-CUDA devices the captured rows stay on the accelerator and are returned as device tensors",
+          "severity": "minor",
+          "file": "/root/vllm-lens-fixed/vllm_lens/_worker_ext.py",
+          "line": 953,
+          "scenario": "vllm-lens runs on a non-'cuda' torch device (XPU, or plugin backends such as NPU/HPU whose runners subclass the GPU runner). _capture_layer takes the else branch `host, event = sel.clone(), None`, so every captured chunk is a device tensor and accumulates in device memory until retrieval. _build_payload only moves the result to CPU `if stacked.is_cuda`, so the pickled payload carries device tensors to the API process. Upstream always did `hidden_states[start:end].cpu()`.",
+          "evidence": "Line 953: `host, event = sel.clone(), None`. Lines 1736-1737: `if stacked.is_cuda: stacked = stacked.cpu()`. Upstream _worker_ext.py:581-585 used `.cpu()` unconditionally.",
+          "suggested_fix": "Use `host, event = sel.to('cpu'), None` (or `.cpu()`) in the non-CUDA branch, and in _build_payload move to CPU whenever `stacked.device.type != 'cpu'`."
+        },
+        {
+          "title": "With FULL CUDA graphs configured, FA3 eager passes use a different split-KV setting than upstream's enforce_eager, so captures may not be bitwise identical",
+          "severity": "minor",
+          "file": "/root/vllm-lens-fixed/vllm_lens/_activations_plugin.py",
+          "line": 399,
+          "scenario": "Hopper GPU with FlashAttention 3 (aot_schedule=True) and the plugin default cudagraph_mode=FULL_DECODE_ONLY. Every eager (hooked) pass with num_actual_tokens <= max_cudagraph_capture_size builds attention metadata with max_num_splits=32. Upstream runs with enforce_eager (no full graphs) and uses max_num_splits=0 (FA3 heuristic). A different split-KV reduction order changes rounding in the attention output, so captured residual streams (and steering outcomes) can differ from upstream eager mode, against the stated 'identical to upstream eager' standard, even though the pass itself runs eagerly.",
+          "evidence": "vllm/v1/attention/backends/flash_attn.py:696-697 `self.use_full_cuda_graph = self.compilation_config.cudagraph_mode.has_full_cudagraphs()` is config-level, not per pass. :719-720 sets `self.max_num_splits = attention_config.flash_attn_max_num_splits_for_cuda_graph` (default 32, config/attention.py:61) when FA3. :805-815 `max_num_splits = 0 ... if self.use_full_cuda_graph and ... num_actual_tokens <= self.max_cudagraph_size: max_num_splits = self.max_num_splits`. The plugin sets `cc.cudagraph_mode = CUDAGraphMode.FULL_DECODE_ONLY` (lines 397-399/404).",
+          "suggested_fix": "Document that CUDA-graph mode is not bitwise identical to eager on FA3, and add a GPU equality test (graphs on vs VLLM_LENS_CUDA_GRAPHS=0) on Hopper. Where exact reproducibility of captures matters, default to eager when capture is requested, or pin max_num_splits for both modes (e.g. VLLM_BATCH_INVARIANT, or a matching flash_attn_max_num_splits_for_cuda_graph) so both paths use the same split setting."
+        }
+      ],
+      "verdicts": [
+        {
+          "title": "The forced-eager routing never fires, so decode steps of capturing requests replay a CUDA graph and their activations are silently dropped",
+          "real": false,
+          "severity": "critical",
+          "reasoning": "This finding was written against an older copy of the file. _worker_ext.py was last changed at 20:11; exp_determine.py was written at 20:03. In the current code, _current_plan (lines 563-583) has no is_forward_context_available() check. It returns None only when not _in_execute or while a stream is capturing, and its comment says the dispatch wrapper plans the pass before the forward context exists. The only remaining is_forward_context_available() check (line 488) is in the attn-metadata fallback of _host_query_start_loc, which is the fix the reviewer suggested. The plan build reads host state that vLLM 0.30 has filled before determine runs: _update_states sets num_computed_tokens_cpu (gpu_model_runner.py:4226) and _prepare_inputs sets query_start_loc.np (:2080-2085, called at :4269). Both happen before _determine_batch_execution_and_padding at :4288. I re-ran the reviewer's dispatch_exp.py on the current code. Output: seen [('determine', True, False), ('forward', 'NONE', True)], passes_forced_eager 1. So force_eager=True reaches vLLM while there is no forward context yet, and the pass is dispatched as NONE (eager).",
+          "suggested_fix": "None needed for the routing. Still add the suggested GPU test: assert lens_stats()['passes_forced_eager'] > 0 and that the captured length equals n_prompt + n_gen - 1 with CUDA graphs on. The try/except part of the suggestion belongs to the malformed-input finding (see that verdict)."
+        },
+        {
+          "title": "Pinned capture blocks are shared per pass and power-of-two rounded, so retrieved or aborted requests' activations stay page-locked",
+          "real": true,
+          "severity": "major",
+          "reasoning": "Confirmed from the code. _capture_layer (lines 948-951) makes one torch.empty(..., pin_memory=True) block per layer per pass, holding the rows of every capturing request. _flush_capture_blocks (lines 1696-1699) files block.host[offset:offset+n], which are views sharing that block's storage. _build_payload pops one request and torch.cat/stack makes new tensors. Other requests' views keep the whole shared block alive, so a finished request's rows stay in memory until every request co-scheduled with it in that pass has been retrieved or cleared. The reviewer's CPU experiment shows this: 160 bytes owned by the small request, 80160 bytes kept alive. On CUDA these blocks come from torch's CachingHostAllocator. CachingHostAllocator.h:300-306 rounds each pinned size up to a power of two (thresholds default to SIZE_MAX, AllocatorConfig.h:361-363), and freed blocks go back to the free list rather than to the OS. Peak capture memory therefore stays page-locked for the life of the worker. Upstream used a per-request .cpu() into exact-size pageable memory that was freed on pop. Retention is bounded by the lifetime of the longest-lived co-batched capturing request, not unbounded. Even so, all-layer captures are GB-scale and the memory cannot be swapped, so this is a real host-memory regression. The is_pin_memory_available() point (WSL) is a smaller side issue.",
+          "suggested_fix": "In _flush_capture_blocks, after event.synchronize(), copy each segment out with block.host[o:o+n].clone() into pageable memory, or concatenate per request, then drop the block reference. Better: stage through a small reused pool of pinned buffers and flush at the end of each execute_model, or when pending bytes pass a threshold. Fall back to a synchronous .cpu() when vllm's is_pin_memory_available() is False."
+        },
+        {
+          "title": "Malformed output_residual_stream from one request breaks the whole batch's plan (and would crash the engine once the plan is built in the determine wrapper)",
+          "real": true,
+          "severity": "major",
+          "reasoning": "Confirmed, and the current code is already in the worse state the finding predicts, so I am raising it from minor to major. vLLM 0.30 accepts vllm_xargs values as str (completion/chat/responses protocol: dict[str, str|int|float|list[...]]). The plugin passes output_residual_stream through without checking it. _parse_layer_request (line 346) runs json.loads('[[1,2]]') and then frozenset([[1,2]]), which raises TypeError: unhashable type: 'list'. Any list holding a list or dict does the same, and output_qk takes the same path. The current determine wrapper (lines 614-619) calls _current_plan, then _build_step_plan, then _resolve_request, with no try/except. The wrapper is installed in every mode, eager included, and vLLM calls determine on every execute_model (gpu_model_runner.py:4288). So the exception leaves execute_model and is fatal to EngineCore. That lets one HTTP request take down the server for every user. v_malformed_cap.out, run against the current code, shows the traceback going through determine (line 616), then _current_plan (581), then _parse_layer_request (346) and out of execute_model. Upstream only did `layer_idx not in value`, which never raises.",
+          "suggested_fix": "Make _parse_layer_request total: keep only int-convertible scalars, for example frozenset(int(x) for x in value if isinstance(x, (int, float)) and not isinstance(x, bool)), and treat anything else as no layers or as all layers, as documented. Wrap _resolve_request per row in try/except, log through _log_hook_error and treat the row as idle. Also wrap the plan build in the determine wrapper in try/except: on error set force_eager=True and leave _step_plan None, so nothing from the plugin can propagate into execute_model."
+        },
+        {
+          "title": "On non-CUDA devices the captured rows stay on the accelerator and are returned as device tensors",
+          "real": true,
+          "severity": "minor",
+          "reasoning": "Confirmed from the code. In vLLM 0.30, XPUModelRunner subclasses GPUModelRunner (v1/worker/xpu_model_runner.py:16), and nothing in vllm-lens restricts it to CUDA. ROCm reports device type 'cuda', so it is unaffected. On XPU, _capture_layer takes the else branch, host = sel.clone() (line 953), so chunks pile up in device memory outside vLLM's memory budget. _build_payload moves the result to CPU only when stacked.is_cuda (lines 1737-1738), so the pickled payload carries XPU tensors to the API process. Upstream always used .cpu(), and the Q/K path in this same file still does (lines 1312-1313). The vLLM CPU backend is fine, since clone() there already yields a CPU tensor. This regresses only non-CUDA accelerator platforms, which is why it is minor.",
+          "suggested_fix": "In the non-CUDA branch, use host = sel.to('cpu') (or sel.cpu()), with event=None. In _build_payload, move to CPU whenever stacked.device.type != 'cpu'."
+        },
+        {
+          "title": "With FULL CUDA graphs configured, FA3 eager passes use a different split-KV setting than upstream's enforce_eager, so captures may not be bitwise identical",
+          "real": false,
+          "severity": "minor",
+          "reasoning": "The configuration difference is real. FlashAttentionMetadataBuilder sets use_full_cuda_graph from the config-wide cudagraph_mode.has_full_cudagraphs(), which is True for the plugin's FULL_DECODE_ONLY. When aot_schedule is on (FA3), it sets self.max_num_splits = 32 (flash_attn.py:696-720). Eager passes with num_actual_tokens <= max_cudagraph_size then get max_num_splits=32 instead of 0 (:805-815). FA2 is unaffected, because max_num_splits stays 0 when aot_schedule is False. However, the config docstring and vLLM's own comment describe the value as an upper bound on splits ('max number splits'), not a forced count. So results differ only for shapes where FA3's heuristic or dynamic split would choose differently under the cap. That is plausible for small-batch, long-context decode, but I could not confirm any numerical difference without a GPU (not allowed here). The finding itself hedges ('may'). Graph replay of non-hooked passes also changes numerics by design (intent 4). By the default-to-false rule this stays unconfirmed.",
+          "suggested_fix": "Add a Hopper GPU test that compares captures with graphs on against VLLM_LENS_CUDA_GRAPHS=0 for a long-context, batch-1 decode. If they differ, document it, or pin the split setting when capture or steering is requested, for example by matching flash_attn_max_num_splits_for_cuda_graph or with VLLM_BATCH_INVARIANT."
+        }
+      ]
+    },
+    {
+      "key": "hooks",
+      "findings": [
+        {
+          "title": "The determine() wrapper never sets force_eager, so hooked decode passes replay FULL CUDA graphs and no hooks run on them",
+          "severity": "critical",
+          "file": "/root/vllm-lens-fixed/vllm_lens/_worker_ext.py",
+          "line": 576,
+          "scenario": "Default config (the plugin sets cudagraph_mode=FULL_DECODE_ONLY). Any request with post-hooks, pre-hooks, output_qk, capture or steering reaches a uniform-decode step. The determine wrapper calls _current_plan(), which returns None because vLLM has not set a forward context yet. force_eager stays False and the dispatcher returns FULL, so the graph replays and no Python hook runs. Generic hooks, Q/K capture, capture and steering all miss every decode-only pass, but still run on mixed prefill+decode passes, so what you get depends on how requests were batched. The raw-QK reference hooks also skip replayed passes, so the bit-for-bit Q/K tests cannot catch this.",
+          "evidence": "vLLM 0.30 gpu_model_runner.py:4288 calls self._determine_batch_execution_and_padding(...) and only later, at :4446, enters `with set_forward_context(...)`. forward_context.py:208 is `is_forward_context_available(): return _forward_context is not None`. _current_plan (_worker_ext.py:571-581) does `if not extension._in_execute: return None` ... `if not is_forward_context_available(): return None`, and the wrapper (613-618) only sets kwargs['force_eager']=True when `plan is not None and plan.active`. CPU repro /tmp/claude-0/-workspace/f7b8273c-d00a-47da-b423-a819fa789abb/scratchpad/review/hk_exp_determine.py mimics execute_model's ordering and prints: `dispatch mode returned: FULL`, `force_eager passed to determine: [False]`, `plan.active once forward context exists: [True]`, stats `passes_forced_eager: 0`. No test covers force_eager (grep of tests/ finds no force_eager or passes_forced_eager).",
+          "suggested_fix": "Build the plan without needing a forward context. _build_step_plan only reads host buffers: runner.query_start_loc.np, filled by _prepare_inputs at gpu_model_runner.py:2080 before determine runs, and input_batch.num_computed_tokens_cpu. Drop the is_forward_context_available() gate inside execute_model, or have the determine wrapper call _build_step_plan directly and cache it for that _exec_step. Keep the forward-context fallback only for runners without the host mirror. Add a unit test that drives execute_model -> determine -> forward and asserts force_eager=True and passes_forced_eager>0."
+        },
+        {
+          "title": "Pre-hooks after layer 0 sum hidden+residual even on layers that ignore the residual argument (Command-R, Phi-3.5-MoE, EXAONE-4), so an identity pre-hook corrupts the stream",
+          "severity": "major",
+          "file": "/root/vllm-lens-fixed/vllm_lens/_worker_ext.py",
+          "line": 1130,
+          "scenario": "Command-R/Aya (commandr.py), Cohere2-MoE, Cohere-Compass, Phi-3.5-MoE (phimoe.py), EXAONE-4 (exaone4.py) and GraniteMoeHybrid attention layers are called as layer(positions, hidden_states, residual), but they start with `residual = hidden_states` and return (full_stream, stale_residual). The true stream entering layer L>0 is just hidden_states. The new pre-hook shows the hook hidden_states+stale_residual and writes the result into hidden_states, which the layer uses as the whole stream. So `return h` feeds the layer stream+stale_residual, and `return h + v` steers on top of that corruption. Upstream passed args[1], the true stream, and was correct for these positional-call models, so this is a regression outside the intended 'fused-residual' change.",
+          "evidence": "_pre_hook_inner: `stream = hidden if residual is None else hidden + residual` (1130), then `new_hidden[start:end] = result` / `new_residual[start:end] = 0` (1165-1170). commandr.py:319-335: `residual = hidden_states` ... `hidden_states = residual + parallel_block_output; return hidden_states, residual`. phimoe.py and exaone4.py follow the same pattern, and all three call layers positionally (phimoe.py:499, commandr.py:391, exaone4.py:356). CPU repro /tmp/claude-0/-workspace/f7b8273c-d00a-47da-b423-a819fa789abb/scratchpad/review/hk_exp_nonfused.py, identity pre-hook on a PhiMoE-like layer: upstream `left layer-1 input unchanged: True | saw 3.0 expected 3.0`; fixed `False | saw 4.0 expected 3.0`. The same hidden+residual assumption already makes upstream capture/post-hooks wrong for these models (output[0]+output[1]); that part is pre-existing.",
+          "suggested_fix": "Decide per layer at install time whether the layer actually uses its residual input. For example, inspect type(layer).forward: an unconditional `residual = hidden_states` before any read means non-fused, while `if residual is None:` means fused. An env or allow-list override would also work. For non-fused layers use stream = hidden and replace hidden only, as upstream did. Ideally apply the same flag in _hook_inner and _capture_layer to fix the pre-existing capture/post-hook sum too."
+        },
+        {
+          "title": "Prefetched parameters are dropped when prefetch_parameters runs before the first hooked request (the README logit-lens flow)",
+          "severity": "major",
+          "file": "/root/vllm-lens-fixed/vllm_lens/_worker_ext.py",
+          "line": 1492,
+          "scenario": "A fresh `vllm serve`, then client.prefetch_params(['lm_head.weight']) (POST /v1/hooks/prefetch, which calls prefetch_parameters with no install_hooks first), then client.generate(..., hooks=[hook]), exactly as in examples/logit_lens.py and examples/emotion_tracker.py. prefetch_parameters writes into the class-level `_prefetched_params` dict. The first hooked request then calls install_hooks -> _init_lens_state, which sees no instance attribute and installs a new empty dict. ctx._prefetched is empty, so get_parameter falls back to a local lookup. Under pipeline parallelism, hooks on non-last stages raise 'not on this pipeline-parallel stage' and their results are missing (errors are rate-limited in the log). Under TP, every hook call silently does an all_gather. Upstream install_hooks never touched _prefetched_params, so this flow worked there.",
+          "evidence": "_init_lens_state loops over (..., (\"_prefetched_params\", dict)) with `if name not in d: setattr(self, name, factory())`. prefetch_parameters (2221-2306) never calls _init_lens_state and ends with `self._prefetched_params[name] = param`, which mutates the class attribute declared at 2219. _hooks_router.py:167 calls prefetch_parameters directly. CPU repro /tmp/claude-0/-workspace/f7b8273c-d00a-47da-b423-a819fa789abb/scratchpad/review/hk_exp_prefetch.py: upstream `after install_hooks state init: ['lm_head.weight']`; fixed `after install_hooks state init: []`.",
+          "suggested_fix": "Call self._init_lens_state() at the top of prefetch_parameters (and clear_prefetched_params). Alternatively, have _init_lens_state copy any class-level contents: `self._prefetched_params = dict(type(self)._prefetched_params)` (or remove the entry and keep upstream behaviour)."
+        },
+        {
+          "title": "_locate_layer_input's positional fallback assumes (positions, hidden_states, residual) and misreads GPT-OSS, GPT-2/OPT and LoopCoder layer calls",
+          "severity": "minor",
+          "file": "/root/vllm-lens-fixed/vllm_lens/_worker_ext.py",
+          "line": 1092,
+          "scenario": "(a) GPT-OSS, Bailing-MoE(-V3), Param2MoE and Sarvam call layer(hidden_states, positions, residual) positionally. At layer 0 the pre-hook is handed `positions` (int64, shape (n,)) as the hidden states, and returning a tensor overwrites positions. At layer>0, `hidden + residual` broadcasts positions against residual and raises on every pass. (b) GPT-2 and OPT call layer(hidden_states), which raises 'cannot find the hidden states'. (c) iquest_loopcoder calls layer(positions, hidden_states, loop_idx, gate_proj): the int loop_idx is taken as the residual, the hook sees hidden+loop_idx, and any replacement raises `'int' object has no attribute 'clone'`. (c) is a regression, since upstream's args[1] worked there. (a) and (b) were already broken upstream but remain unfixed by the pre-hook fix.",
+          "evidence": "`if len(args) > 1: residual = args[2] if len(args) > 2 else kwargs.get(\"residual\"); return args[1], residual, \"args\"`. gpt_oss.py:530 `x, residual = layer(x, positions, residual)`; bailing_moe_v3.py:1369, param2moe.py:538, sarvam.py:561 use the same order; iquest_loopcoder.py:461 `layer(positions, hidden_states, loop_idx, gate_proj)`; gpt2/opt `hidden_states = layer(hidden_states)`. CPU repro /tmp/claude-0/-workspace/f7b8273c-d00a-47da-b423-a819fa789abb/scratchpad/review/hk_exp_prehook.py case 5: `gpt-oss layer 0 pre-hook was shown: ((4,), torch.int64)`; at layer>0: `RuntimeError: The size of tensor a (4) must match the size of tensor b (8)`, hook_errors=1.",
+          "suggested_fix": "At install time, cache inspect.signature(type(layer).forward). In the hook, bind with sig.bind(layer, *args, **kwargs), find hidden states by parameter name ('hidden_states', else 'x', else the first tensor parameter), and treat a value as the residual only if its parameter is named 'residual' and it is a Tensor. Write replacements back through the bound arguments."
+        },
+        {
+          "title": "After layer 0, the pre-hook's input view is overwritten with its output, and in-place edits are applied at layer 0 but dropped after it",
+          "severity": "minor",
+          "file": "/root/vllm-lens-fixed/vllm_lens/_worker_ext.py",
+          "line": 1171,
+          "scenario": "A pre-hook `def f(ctx, h): ctx.saved['in'] = h; return torch.zeros_like(h)` (saving its input without clone) at layer>0 on a fused layer: `stream[start:end] = result` writes into the tensor the hook was given, so saved['in'] comes back as zeros. Upstream (and this code at layer 0) cloned before writing, so the saved input was kept. Likewise, a hook that edits h in place and returns None changes the layer input at layer 0 (h aliases the real input) but has no effect at layer>0 (h is a view of a temporary sum).",
+          "evidence": "`stream = hidden if residual is None else hidden + residual` ... `result = hook.fn(hctx, stream[start:end])` ... `stream[start:end] = result` (1130-1171). Upstream: `if not modified: working = input_tensor.clone()` before `working[start:end] = result`. CPU repro /tmp/claude-0/-workspace/f7b8273c-d00a-47da-b423-a819fa789abb/scratchpad/review/hk_exp_prehook.py: case 3 `layer>0: saved input still equals the stream it was shown: False | saved is all zeros: True` vs case 3b layer 0 `True`; case 4: in-place edit reaches the layer at layer 0 (True) but not at layer>0.",
+          "suggested_fix": "On the first replacement in a fused layer, clone stream before writing (`stream = stream.clone()` once), as upstream did with `working`. Document that in-place edits without a return value are not supported, or apply them consistently, e.g. by checking whether the stream was mutated."
+        },
+        {
+          "title": "Q/K capture now slices with the global query_start_loc instead of the layer's own metadata, which is wrong for layers under kv_sharing_fast_prefill",
+          "severity": "minor",
+          "file": "/root/vllm-lens-fixed/vllm_lens/_worker_ext.py",
+          "line": 1304,
+          "scenario": "Gemma3n with --kv-sharing-fast-prefill and output_qk: the KV-shared (cross-decoder) layers run attention only on the logits tokens, so their query/key tensors have fewer rows and their per-layer metadata carries a truncated query_start_loc. The new code slices q3[start:end] with the full batch's plan.qsl, so those layers' Q/K rows are mis-assigned or truncated. Upstream deliberately used `attn_metadata.get(attn_module.layer_name)` first. For Llama-4 chunked-local layers the new global offsets are actually more correct than upstream's virtual-batch offsets.",
+          "evidence": "New: `start, end = plan.qsl[i], plan.qsl[i + 1]` with plan.qsl from runner.query_start_loc.np. Upstream _qk_hook_inner: `meta = attn_metadata.get(getattr(attn_module, \"layer_name\", \"\")); if meta is not None and hasattr(meta, \"query_start_loc\"): query_start_loc = meta.query_start_loc`. vLLM gpu_model_runner.py:7080 wraps fast-prefill-eligible layers in a FastPrefill backend, and v1/attention/backends/utils.py:652-661 rebuilds query_start_loc from logits_indices.",
+          "suggested_fix": "For Q/K capture, use the layer's own metadata when it is a fast-prefill (truncated) metadata, and the global host qsl otherwise. Or refuse output_qk when cache_config.kv_sharing_fast_prefill is on."
+        }
+      ],
+      "verdicts": [
+        {
+          "title": "The determine() wrapper never sets force_eager, so hooked decode passes replay FULL CUDA graphs and no hooks run on them",
+          "real": false,
+          "severity": "critical",
+          "reasoning": "This is already fixed in the current working copy. `_current_plan` (now about lines 586-604) no longer checks `is_forward_context_available()`; its comment says the dispatch wrapper plans the pass before vLLM sets the context. `_host_query_start_loc` reads `runner.query_start_loc.np`, which `_prepare_inputs` fills at gpu_model_runner.py:2080, before `_determine_batch_execution_and_padding` runs at :4288. The forward-context fallback is only used when that host mirror is missing. I re-ran the reviewer's own repro, hk_exp_determine.py, against the current code. It now prints `dispatch mode returned: NONE`, `force_eager passed to determine: [True]` and `passes_forced_eager: 1`, so hooked passes do run eagerly.",
+          "suggested_fix": "None needed for correctness. Adding a regression unit test that goes execute_model -> determine and asserts force_eager=True and passes_forced_eager>0 would still help."
+        },
+        {
+          "title": "Pre-hooks after layer 0 sum hidden+residual even on layers that ignore the residual argument (Command-R, Phi-3.5-MoE, EXAONE-4), so an identity pre-hook corrupts the stream",
+          "real": true,
+          "severity": "major",
+          "reasoning": "Confirmed in the vLLM 0.30 source. commandr.py:312-335 starts with `residual = hidden_states`; its LayerNorm/RMSNorm `forward(hidden_states, residuals)` ignores the residual and passes it through, and the layer returns `(residual + block_out, old_input)`. phimoe.py:418-441 and exaone4.py:262-280 follow the same pattern. All three model loops pass the returned residual into the next layer positionally (commandr.py:391, phimoe.py:499, exaone4.py:356), so at layer L>0 `residual` is a stale non-None tensor. `_pre_hook_inner` checks only whether residual is None (`stream = hidden if residual is None else hidden + residual`). It then writes `new_hidden[start:end] = result` and zeroes the residual. These layers ignore the residual, so they consume hidden+stale as their whole stream. Upstream passed args[1], which is the true stream for these positional calls. Re-running hk_exp_nonfused.py: upstream prints `unchanged: True | saw 3.0 expected 3.0`, fixed prints `unchanged: False | saw 4.0 expected 3.0`. So this is a silent regression outside the documented fused-residual change: read-only pre-hooks see the wrong stream, and even an identity hook corrupts the forward pass.",
+          "suggested_fix": "Decide per layer at install time whether the layer is fused-residual. For example, check the layer's forward source or a known-model allow-list for the `if residual is None:` pattern versus an unconditional `residual = hidden_states`. For non-fused layers use `stream = hidden` and replace only hidden_states, as upstream did. Optionally use the same flag in _hook_inner and _capture_layer, which have the same pre-existing output[0]+output[1] assumption."
+        },
+        {
+          "title": "Prefetched parameters are dropped when prefetch_parameters runs before the first hooked request (the README logit-lens flow)",
+          "real": false,
+          "severity": "major",
+          "reasoning": "This is already fixed in the current working copy. `prefetch_parameters` now calls `self._init_lens_state()` at line 2293, before it writes `self._prefetched_params[name]`, so the dict it fills is the instance one that later `install_hooks` calls keep (`_init_lens_state` is idempotent via `_lens_state_ready`). `clear_prefetched_params` also calls `_init_lens_state()` first (line 2373). Re-running hk_exp_prefetch.py on the fixed copy prints `after install_hooks state init: ['lm_head.weight']`, so the prefetched parameter survives.",
+          "suggested_fix": "None needed."
+        },
+        {
+          "title": "_locate_layer_input's positional fallback assumes (positions, hidden_states, residual) and misreads GPT-OSS, GPT-2/OPT and LoopCoder layer calls",
+          "real": true,
+          "severity": "minor",
+          "reasoning": "Part (c) is a confirmed regression. iquest_loopcoder.py:461 calls `layer(positions, hidden_states, loop_idx, gate_proj)`, so `_locate_layer_input` takes the int `loop_idx` as the residual. Any replacement then hits `new_residual = residual.clone()`. My CPU check, v2_prehook_checks.py, shows `AttributeError: 'int' object has no attribute 'clone'`, `replacement applied: False`, `hook_errors: 1`. Upstream's args[1] was correct there. Parts (a) and (b) are real but pre-existing. GPT-OSS (gpt_oss.py:530, `layer(x, positions, residual)`) hands the hook `positions` at layer 0 in both versions; at layer>0 upstream showed positions silently while the fixed code raises on the broadcast. GPT-2/OPT (`layer(hidden_states)`) raised upstream (IndexError) and still raise. The impact is limited to niche models plus already-broken cases, hence minor.",
+          "suggested_fix": "Bind args/kwargs against the cached `inspect.signature(type(layer).forward)` at install time. Take hidden states from the parameter named `hidden_states` (else `x`, else the first tensor), and treat a value as the residual only if its parameter is named `residual` and it is a Tensor (or None). Write replacements back through the bound arguments."
+        },
+        {
+          "title": "After layer 0, the pre-hook's input view is overwritten with its output, and in-place edits are applied at layer 0 but dropped after it",
+          "real": true,
+          "severity": "minor",
+          "reasoning": "Confirmed by reading the code and a CPU check. At layer>0 on a fused layer, `stream = hidden + residual` is a temporary; the hook gets `stream[start:end]`, and the code then does `stream[start:end] = result` without cloning first. In v2_prehook_checks.py, a hook that saves its input and returns zeros ends up with `saved input equals true stream: False | saved all zeros: True`, while upstream cloned (`working = input_tensor.clone()`) before writing. An in-place edit with no return value reaches the layer at layer 0 (`seen 102.0`) but not at layer>0 (`seen 3.0`). Upstream, on positional fused models, applied such edits to args[1] and the layer saw them. In-place mutation is not the documented API (returning a tensor is), so the impact is limited.",
+          "suggested_fix": "In the fused branch, clone `stream` before the first write (or pass the hook a separate view) so tensors the hook saved are not overwritten. Either document that in-place edits without a return value are unsupported, or apply them consistently by treating a mutated stream at layer>0 as a replacement."
+        },
+        {
+          "title": "Q/K capture now slices with the global query_start_loc instead of the layer's own metadata, which is wrong for layers under kv_sharing_fast_prefill",
+          "real": false,
+          "severity": "minor",
+          "reasoning": "This cannot happen in vLLM 0.30. Only the trailing layers in `shared_kv_cache_layers` get the FastPrefill backend with truncated metadata (gpu_model_runner.py:7405-7413, 7080). In the models that support `kv_sharing_fast_prefill` (gemma3n.py, gemma4.py), those KV-shared layers call `self.attn(q, None, None)` (gemma3n.py:426, gemma4.py:548). `_qk_hook_inner` reads key=None and returns early (`if query is None or key is None: _warn_qk_skipped(...); return`), and upstream does the same at its line 786. So in both versions the truncated layers produce no Q/K rows at all, and every layer that does capture Q/K runs on the full batch, where its metadata's query_start_loc equals the global host qsl.",
+          "suggested_fix": "None needed. Optionally, document that KV-shared layers (Gemma3n/Gemma4) produce no Q/K capture."
+        }
+      ]
+    },
+    {
+      "key": "state",
+      "findings": [
+        {
+          "title": "One malformed output_residual_stream / output_qk value now crashes the engine: plan building in the dispatch wrapper has no exception guard",
+          "severity": "major",
+          "file": "/root/vllm-lens-fixed/vllm_lens/_worker_ext.py",
+          "line": 614,
+          "scenario": "Hooks are installed and any request arrives with a nested list or dict inside the list, e.g. an OpenAI request with vllm_xargs={\"output_residual_stream\": \"[[0]]\"} (the vLLM protocol accepts strings), or client capture_layers=[[0,1]]. _parse_layer_request runs json.loads and gets [[0]], then frozenset([[0]]) raises TypeError: unhashable type 'list'. _resolve_request calls it, which is called by _build_step_plan, which is called by _current_plan from the determine() wrapper. determine() runs inside GPUModelRunner.execute_model (vllm v1/worker/gpu_model_runner.py:4288) with no try/except, so the TypeError leaves execute_model and EngineCore goes dead for every user. This happens with CUDA graphs on or off, because the wrapper is installed whenever the runner has the method. Upstream only ran `layer_idx not in output_residual_stream` inside the hook's try/except, so the same input was harmless (that request just captured nothing).",
+          "evidence": "CPU experiment (/tmp/claude-0/-workspace/f7b8273c-d00a-47da-b423-a819fa789abb/scratchpad/review/exp2.py, case 5). A fake runner calls the wrapped _determine_batch_execution_and_padding the way vLLM 0.30 does. With extra_args {\"output_residual_stream\": \"[[0]]\"} it printed: `execute_model raised: TypeError unhashable type: 'list'`. Code: `if isinstance(value, list): return True, frozenset(value)` (line 346), and `def determine(...): if extension._in_execute ...: plan = _current_plan(extension)` (lines 614-616), which is unguarded, unlike _make_hook/_make_pre_hook/_make_qk_hook, which all catch and call _log_hook_error. vllm_xargs type is dict[str, str|int|float|list[str|int|float]] (entrypoints/openai/chat_completion/protocol.py:494), so a string payload passes through.",
+          "suggested_fix": "Wrap the plan build in determine() in try/except: log through _log_hook_error and set force_eager=True as the safe fallback. Also make _parse_layer_request total, e.g. keep only int-coercible entries (frozenset(int(x) for x in value if isinstance(x, int) or (isinstance(x, str) and x.lstrip('-').isdigit()))) and catch TypeError, ideally with validation in the plugin before the request is submitted."
+        },
+        {
+          "title": "Cached _ReqPlan entries of finished requests keep cleared steering tensors (and the whole stacked batch block) and hook closures alive on GPU",
+          "severity": "major",
+          "file": "/root/vllm-lens-fixed/vllm_lens/_worker_ext.py",
+          "line": 1504,
+          "scenario": "clear_steering_data(_many) and clear_hook_data(_many) pop _steering_data/_hook_data and bump _lens_gen. Nothing removes the finished requests' entries from _req_plans, and each _ReqPlan holds `steer` (the SteeringVector objects with device tensors) and `hooks` (Hook objects whose cloudpickled closures can hold large tensors). Entries are pruned only when len(cache) > num_reqs + 4096 (line 554). Offline example: generate() with 1000 position-specific steered prompts. set_steering_data_many stacks every same-shape vector into one GPU block and unbinds it into views (line 1615), so any one stale plan pins the whole block. After generate() returns and clear_steering_data_many runs, all 1000 stale entries keep the block resident. Further calls add more blocks until about 4096 stale entries build up. Async-server example: per-request 3-D vectors of shape (1, 64, 4096) in bf16 are 512 KiB each, and 4096 stale entries pin about 2 GiB of GPU memory outside vLLM's KV budget. Upstream freed the tensors as soon as clear_steering_data ran. A gen bump already invalidates every cached entry, so keeping them has no benefit.",
+          "evidence": "CPU experiment (/tmp/claude-0/-workspace/f7b8273c-d00a-47da-b423-a819fa789abb/scratchpad/review/exp_state.py, case 3): after set_steering_data_many({_steer_0,_steer_1}), one execute_model pass, clear_steering_data_many([...]) and removal of the requests from runner.requests, it printed `_steering_data empty: True`, `_req_plans entries still cached: ['x-1', 'x-2']`, `SteeringVector of _steer_1 still alive: True`, `cached plan holds tensor sharing the stacked block: True`. Code: `def _bump_gen(self): self._lens_gen += 1` (no cache drop), `if len(cache) > num_reqs + _REQ_CACHE_SLACK:` (line 554), `_REQ_CACHE_SLACK = 4096`.",
+          "suggested_fix": "Make _bump_gen also call self._req_plans.clear(): every entry is invalid after a bump anyway, and live rows re-resolve on the next pass. Also pop scheduler_output.finished_req_ids from _req_plans in the execute_model wrapper so idle entries are freed promptly. Optionally have _prepare_steering skip stacking (or .clone() each view) when keys may be cleared independently."
+        },
+        {
+          "title": "prefetch_parameters called before any other lens RPC is silently discarded by _init_lens_state",
+          "severity": "major",
+          "file": "/root/vllm-lens-fixed/vllm_lens/_worker_ext.py",
+          "line": 1493,
+          "scenario": "On a fresh server, a user calls client.prefetch_params([\"lm_head.weight\"]) (POST /v1/hooks/prefetch, which calls collective_rpc(\"prefetch_parameters\") directly) and then calls register_hooks() or sends any lens request. prefetch_parameters does not call _init_lens_state, so `self._prefetched_params[name] = param` writes into the class-level dict. The next RPC (install_hooks, set_persistent_hooks, set_steering_data, clear_captured_states, ...) runs _init_lens_state, sees '_prefetched_params' missing from the instance __dict__ and installs an empty dict that shadows it. Hooks then receive ctx._prefetched == {}. Under PP, ctx.get_parameter raises 'not on this pipeline-parallel stage' inside the hook, which is swallowed and rate-limited, so hook results go missing. Under TP it falls back to an all_gather on every call. Upstream never reset _prefetched_params, so this flow worked.",
+          "evidence": "CPU experiment (/tmp/claude-0/-workspace/f7b8273c-d00a-47da-b423-a819fa789abb/scratchpad/review/exp_state.py, case 2): `before init: ['lm_head.weight'] in instance dict: False` / `after init: []`. Code: _init_lens_state loop contains (\"_prefetched_params\", dict) with `if name not in d: setattr(self, name, factory())`. prefetch_parameters (line 2222) and clear_prefetched_params do not call _init_lens_state. Router: _hooks_router.py:157-170 `/prefetch` calls only prefetch_parameters.",
+          "suggested_fix": "Call self._init_lens_state() at the top of prefetch_parameters and clear_prefetched_params. Alternatively, have _init_lens_state seed the instance dict from any class-level contents (dict(type(self).__dict__.get('_prefetched_params', {}))) rather than replacing it with an empty dict."
+        },
+        {
+          "title": "Per-request plan cache is keyed only by request id and never notices new sampling_params under the same id",
+          "severity": "minor",
+          "file": "/root/vllm-lens-fixed/vllm_lens/_worker_ext.py",
+          "line": 517,
+          "scenario": "_build_step_plan reuses cache[req_id] whenever rp.gen == _lens_gen. vLLM 0.30 can change a live request's sampling_params without any lens RPC, in two cases. (a) Streaming-input sessions: GPUModelRunner._update_streaming_request (gpu_model_runner.py:1645-1662) sets req_state.sampling_params = new_req_data.sampling_params under the same req_id. (b) With VLLM_DISABLE_REQUEST_ID_RANDOMIZATION (input_processor.py:272-279), a reused external id maps to the same internal id while the old plan is still cached. Either way the stale plan's output_residual_stream/output_qk/_steering_id/_hook_id stay in force. The request captures the wrong layers, misses a newly requested capture, or captures for a request that never asked. In the last case _captured_states/_capture_blocks for that id are never retrieved and leak pinned host memory. Upstream re-read extra_args on every pass.",
+          "evidence": "CPU experiments: exp_state.py case 4 (new request reusing id 'foo' without capture) printed `second request (no capture asked) plan.cap_by_layer: {1: [0]}`. exp2.py case 6 (same req_state, sampling_params swapped to layers [2]) printed `after update to layers [2], plan.cap_by_layer: {1: [0]}`.",
+          "suggested_fix": "In the execute_model wrapper, pop the ids in scheduler_output.scheduled_new_reqs (covers streaming updates and reused ids) and in scheduler_output.finished_req_ids from extension._req_plans before calling the original. Alternatively, store the sampling_params object in _ReqPlan and re-resolve when `runner.requests[req_id].sampling_params is not rp.sp`."
+        },
+        {
+          "title": "Hook-error log budget is per worker lifetime, so later, unrelated failures are mostly hidden",
+          "severity": "minor",
+          "file": "/root/vllm-lens-fixed/vllm_lens/_worker_ext.py",
+          "line": 639,
+          "scenario": "One faulty user hook (or the pre-hook kwargs issue on an older client) raises on every layer of every pass. With 48 layers, five errors use up the 5-traceback budget in the first pass. After that, only every 1000th error from any hook, any request or any kind (hook / pre-hook / qk hook) is logged, for the whole server lifetime. A different, later failure on a long-running server (e.g. a capture or steering bug hit by one request) is very likely never logged, while its hook results or activations silently go missing. Upstream logged every error. The counter resets only through lens_stats(reset=True).",
+          "evidence": "`stats[\"hook_errors\"] += 1; n = stats[\"hook_errors\"]; if n <= _ERROR_LOG_FIRST or n % _ERROR_LOG_EVERY == 0: logger.warning(...)` with _ERROR_LOG_FIRST = 5 and _ERROR_LOG_EVERY = 1000, and a single counter shared by all kinds and all requests.",
+          "suggested_fix": "Rate-limit per key, e.g. (kind, layer-independent exception type and message) or per request id: always log the first occurrence of each new key with a traceback, then sample repeats. Or reset the budget on a time window."
+        }
+      ],
+      "verdicts": [
+        {
+          "title": "One malformed output_residual_stream / output_qk value now crashes the engine: plan building in the dispatch wrapper has no exception guard",
+          "real": true,
+          "severity": "major",
+          "reasoning": "Confirmed. I ran _parse_layer_request directly. Both '[[0]]' and [[0,1]] raise TypeError: unhashable type: 'list', because frozenset(value) is applied to the json.loads result with no validation. The call chain is _resolve_request -> _build_step_plan -> _current_plan -> determine() (_worker_ext.py:614-620), and nothing on it catches errors. In vLLM 0.30, GPUModelRunner.execute_model calls self._determine_batch_execution_and_padding (gpu_model_runner.py:4288) inside the preprocess block with no try/except, so the error leaves execute_model and EngineCore treats it as fatal. vllm_xargs accepts str values (chat_completion/protocol.py:494), and _patched_generate only checks `extra.get('output_residual_stream') is not None` with no shape check. That same request also triggers install_hooks, so a single bad HTTP request kills a fresh server. Upstream only ran `layer_idx in value` inside the hook's try/except, which was harmless.",
+          "suggested_fix": "Make _parse_layer_request total: keep only int entries (accept int-like strings), and treat anything else as no layers or reject it. Also wrap the plan build in determine() in try/except: log via _log_hook_error, then fall back to force_eager=True (or plan=None). Optionally validate output_residual_stream/output_qk in _patched_generate / _patched_llm_generate and raise ValueError before the request is submitted."
+        },
+        {
+          "title": "Cached _ReqPlan entries of finished requests keep cleared steering tensors (and the whole stacked batch block) and hook closures alive on GPU",
+          "real": true,
+          "severity": "major",
+          "reasoning": "Confirmed by reading the code. _bump_gen only increments _lens_gen (line 1504). clear_steering_data(_many) and clear_hook_data(_many) pop the data dicts but never touch _req_plans. The only place that prunes _req_plans is _build_step_plan, when len(cache) > num_reqs + 4096 (line 554), and finished requests' entries are never looked up again, so they are never refreshed. Each _ReqPlan.steer holds the SteeringVector objects with device tensors. _prepare_steering stacks same-shape vectors into one block and unbinds it into views, so one stale entry keeps the whole block alive. Upstream freed these tensors on clear. Here up to about 4096 finished requests' steering tensors and hook closures stay resident, outside vLLM's memory budget. For offline sweeps (repeated generate() calls with per-prompt 3-D vectors) that multiplies peak steering memory by up to roughly 4096/N, and it can reach GBs. A gen bump already invalidates every entry, so keeping them buys nothing.",
+          "suggested_fix": "Have _bump_gen also call self._req_plans.clear(); live rows re-resolve on the next pass. Optionally also pop scheduler_output.finished_req_ids from _req_plans in the execute_model wrapper."
+        },
+        {
+          "title": "prefetch_parameters called before any other lens RPC is silently discarded by _init_lens_state",
+          "real": true,
+          "severity": "major",
+          "reasoning": "Confirmed. prefetch_parameters (line 2222) and clear_prefetched_params never call _init_lens_state. On a fresh worker, `self._prefetched_params[name] = param` therefore writes into the class-level dict defined at line 2220. The next lens RPC (set_persistent_hooks -> install_hooks -> _init_lens_state, or any other) sees '_prefetched_params' missing from the instance __dict__ and sets an empty instance dict that shadows it (line 1493). Hooks then get ctx._prefetched = {} (lines 1046, 1155). The server has no startup lens RPC, and the router's /v1/hooks/prefetch (_hooks_router.py:157-170) calls only prefetch_parameters, so `client.prefetch_params([...])` followed by `client.register_hooks(...)` loses the prefetch. Under PP, HookContext.get_parameter then raises 'not on this pipeline-parallel stage'; that error is swallowed in the hook and the results go missing. Under TP it falls back to a per-call all_gather. The offline LLM.prefetch_params path is unaffected because it calls install_hooks first. Upstream had no reset, so this order worked there.",
+          "suggested_fix": "Call self._init_lens_state() at the top of prefetch_parameters and clear_prefetched_params. Alternatively, seed the instance dict from any class-level contents in _init_lens_state rather than replacing it with an empty dict."
+        },
+        {
+          "title": "Per-request plan cache is keyed only by request id and never notices new sampling_params under the same id",
+          "real": true,
+          "severity": "minor",
+          "reasoning": "The mechanism is real. _build_step_plan re-resolves only when the entry is missing or rp.gen != _lens_gen, and nothing invalidates an entry when runner.requests[req_id].sampling_params changes. In vLLM 0.30, _update_streaming_request (gpu_model_runner.py:1645-1662) replaces req_state.sampling_params under the same req_id for streaming-input sessions, and StreamingInput chunks can carry new SamplingParams (async_llm.py:576-580). A changed output_residual_stream/output_qk/_hook_id/_steering_id mid-session is therefore ignored, where upstream re-read extra_args on every pass. The reused-id case needs the deprecated VLLM_DISABLE_REQUEST_ID_RANDOMIZATION, which vLLM itself warns breaks duplicate ids. Capture-only clears do not bump gen, so in that case the stale entry would also survive. The impact is limited to exotic flows, hence minor.",
+          "suggested_fix": "Store the sampling_params object in _ReqPlan and re-resolve when `runner.requests[req_id].sampling_params is not rp.sp`. Or, in the execute_model wrapper, pop the ids in scheduler_output.scheduled_new_reqs and finished_req_ids from _req_plans before calling the original."
+        },
+        {
+          "title": "Hook-error log budget is per worker lifetime, so later, unrelated failures are mostly hidden",
+          "real": false,
+          "severity": "minor",
+          "reasoning": "The behaviour is a deliberate, documented trade-off, not a defect against the stated standard. That standard is identical results to upstream eager mode, and logging is not a result. _log_hook_error's docstring explains why: a failing hook fires on every layer of every pass, and upstream's per-error tracebacks were exactly the flood that the pre-hook bug produced. Errors are still counted in _lens_stats['hook_errors'], which lens_stats exposes. With the pre-hook kwargs bug fixed, the main source of repeated errors is gone. Per-key sampling would be a nice improvement, but no results go wrong and nothing crashes.",
+          "suggested_fix": "Optional: rate-limit per (kind, exception type/message) so the first occurrence of each new error signature is always logged with a traceback, and sample repeats."
+        }
+      ]
+    }
+  ],
+  "workflowProgress": [
+    {
+      "type": "workflow_phase",
+      "index": 1,
+      "title": "Review"
+    },
+    {
+      "type": "workflow_phase",
+      "index": 2,
+      "title": "Verify"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 1,
+      "label": "review:steering",
+      "phaseIndex": 1,
+      "phaseTitle": "Review",
+      "agentId": "a164e6ce9efda9bc4",
+      "model": "claude-opus-5-5",
+      "state": "done",
+      "startedAt": 1792871701841,
+      "queuedAt": 1792871701082,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "promptPreview": "You are reviewing an uncommitted change to vllm-lens (a vLLM plugin for activation capture, steering and hooks).\n- Modified working copy: /root/vllm-lens-fixed (run `git -C /root/vllm-lens-fixed diff` to see the full change vs upstream commit 3d11fb0).\n- Unmodified upstream for reference: /root/vllm-lens-upstream (same commit, read-only).\n- vLLM 0.30.0 source (the target version): /root/venvs/vlfi…",
+      "promptFramed": true,
+      "lastProgressAt": 1792873567800,
+      "tokens": 167642,
+      "toolCalls": 59,
+      "durationMs": 1865923,
+      "resultPreview": "{\"findings\":[{\"title\":\"norm_match fast path computes L2 norms over a stacked (k, hidden) batch, so on CUDA its reduction order differs from upstream's per-token norms. Results are not bit-identical and depend on how many other steered rows share the pass.\",\"severity\":\"minor\",\"file\":\"/root/vllm-lens-fixed/vllm_lens/_worker_ext.py\",\"line\":849,\"scenario\":\"A model served in fp16 or fp32 (bf16 is rarel…"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 2,
+      "label": "review:lifecycle",
+      "phaseIndex": 1,
+      "phaseTitle": "Review",
+      "agentId": "ada67a4117d7d881e",
+      "model": "claude-opus-5-5",
+      "state": "done",
+      "startedAt": 1792871701853,
+      "queuedAt": 1792871701090,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "promptPreview": "You are reviewing an uncommitted change to vllm-lens (a vLLM plugin for activation capture, steering and hooks).\n- Modified working copy: /root/vllm-lens-fixed (run `git -C /root/vllm-lens-fixed diff` to see the full change vs upstream commit 3d11fb0).\n- Unmodified upstream for reference: /root/vllm-lens-upstream (same commit, read-only).\n- vLLM 0.30.0 source (the target version): /root/venvs/vlfi…",
+      "promptFramed": true,
+      "lastProgressAt": 1792872799307,
+      "tokens": 170951,
+      "toolCalls": 68,
+      "durationMs": 1093595,
+      "resultPreview": "{\"findings\":[{\"title\":\"Hooked passes never get force_eager: _current_plan returns None in the dispatch wrapper because no forward context exists yet, so decode steps replay CUDA graphs and every hook is silently skipped\",\"severity\":\"critical\",\"file\":\"/root/vllm-lens-fixed/vllm_lens/_worker_ext.py\",\"line\":576,\"scenario\":\"Default config (VLLM_LENS_CUDA_GRAPHS unset, so cudagraph_mode=FULL_DECODE_ONL…"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 3,
+      "label": "review:capture",
+      "phaseIndex": 1,
+      "phaseTitle": "Review",
+      "agentId": "aa3f6ff389d83094d",
+      "model": "claude-opus-5-5",
+      "state": "done",
+      "startedAt": 1792871701859,
+      "queuedAt": 1792871701093,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "promptPreview": "You are reviewing an uncommitted change to vllm-lens (a vLLM plugin for activation capture, steering and hooks).\n- Modified working copy: /root/vllm-lens-fixed (run `git -C /root/vllm-lens-fixed diff` to see the full change vs upstream commit 3d11fb0).\n- Unmodified upstream for reference: /root/vllm-lens-upstream (same commit, read-only).\n- vLLM 0.30.0 source (the target version): /root/venvs/vlfi…",
+      "promptFramed": true,
+      "lastProgressAt": 1792873457004,
+      "tokens": 196993,
+      "toolCalls": 49,
+      "durationMs": 1751163,
+      "resultPreview": "{\"findings\":[{\"title\":\"The forced-eager routing never fires, so decode steps of capturing requests replay a CUDA graph and their activations are silently dropped\",\"severity\":\"critical\",\"file\":\"/root/vllm-lens-fixed/vllm_lens/_worker_ext.py\",\"line\":576,\"scenario\":\"Default config (VLLM_LENS_CUDA_GRAPHS unset, so cudagraph_mode=FULL_DECODE_ONLY). A request sets output_residual_stream=True and generat…"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 4,
+      "label": "review:hooks",
+      "phaseIndex": 1,
+      "phaseTitle": "Review",
+      "agentId": "a864974dd88c7cfbf",
+      "model": "claude-opus-5-5",
+      "state": "done",
+      "startedAt": 1792871701860,
+      "queuedAt": 1792871701094,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "promptPreview": "You are reviewing an uncommitted change to vllm-lens (a vLLM plugin for activation capture, steering and hooks).\n- Modified working copy: /root/vllm-lens-fixed (run `git -C /root/vllm-lens-fixed diff` to see the full change vs upstream commit 3d11fb0).\n- Unmodified upstream for reference: /root/vllm-lens-upstream (same commit, read-only).\n- vLLM 0.30.0 source (the target version): /root/venvs/vlfi…",
+      "promptFramed": true,
+      "lastProgressAt": 1792874229581,
+      "tokens": 222966,
+      "toolCalls": 60,
+      "durationMs": 2523684,
+      "resultPreview": "{\"findings\":[{\"title\":\"The determine() wrapper never sets force_eager, so hooked decode passes replay FULL CUDA graphs and no hooks run on them\",\"severity\":\"critical\",\"file\":\"/root/vllm-lens-fixed/vllm_lens/_worker_ext.py\",\"line\":576,\"scenario\":\"Default config (the plugin sets cudagraph_mode=FULL_DECODE_ONLY). Any request with post-hooks, pre-hooks, output_qk, capture or steering reaches a uniform…"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 5,
+      "label": "review:state",
+      "phaseIndex": 1,
+      "phaseTitle": "Review",
+      "agentId": "a7905b5bf69f90fa8",
+      "model": "claude-opus-5-5",
+      "state": "done",
+      "startedAt": 1792871701861,
+      "queuedAt": 1792871701097,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "promptPreview": "You are reviewing an uncommitted change to vllm-lens (a vLLM plugin for activation capture, steering and hooks).\n- Modified working copy: /root/vllm-lens-fixed (run `git -C /root/vllm-lens-fixed diff` to see the full change vs upstream commit 3d11fb0).\n- Unmodified upstream for reference: /root/vllm-lens-upstream (same commit, read-only).\n- vLLM 0.30.0 source (the target version): /root/venvs/vlfi…",
+      "promptFramed": true,
+      "lastProgressAt": 1792873768317,
+      "tokens": 179536,
+      "toolCalls": 49,
+      "durationMs": 2062379,
+      "resultPreview": "{\"findings\":[{\"title\":\"One malformed output_residual_stream / output_qk value now crashes the engine: plan building in the dispatch wrapper has no exception guard\",\"severity\":\"major\",\"file\":\"/root/vllm-lens-fixed/vllm_lens/_worker_ext.py\",\"line\":614,\"scenario\":\"Hooks are installed and any request arrives with a nested list or dict inside the list, e.g. an OpenAI request with vllm_xargs={\\\"output_r…"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 6,
+      "label": "verify:lifecycle",
+      "phaseIndex": 2,
+      "phaseTitle": "Verify",
+      "agentId": "ab9eafaeeace78121",
+      "model": "claude-opus-5-5",
+      "state": "done",
+      "startedAt": 1792872803959,
+      "queuedAt": 1792872802750,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "promptPreview": "You are reviewing an uncommitted change to vllm-lens (a vLLM plugin for activation capture, steering and hooks).\n- Modified working copy: /root/vllm-lens-fixed (run `git -C /root/vllm-lens-fixed diff` to see the full change vs upstream commit 3d11fb0).\n- Unmodified upstream for reference: /root/vllm-lens-upstream (same commit, read-only).\n- vLLM 0.30.0 source (the target version): /root/venvs/vlfi…",
+      "promptFramed": true,
+      "lastProgressAt": 1792873427802,
+      "tokens": 96182,
+      "toolCalls": 26,
+      "durationMs": 623802,
+      "resultPreview": "{\"verdicts\":[{\"title\":\"Hooked passes never get force_eager: _current_plan returns None in the dispatch wrapper because no forward context exists yet\",\"real\":false,\"severity\":\"critical\",\"reasoning\":\"This was true of an earlier version of the file. It is not true of the working copy now (/root/vllm-lens-fixed/vllm_lens/_worker_ext.py, modified 20:11). _current_plan (lines 565-583) no longer checks i…"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 7,
+      "label": "verify:capture",
+      "phaseIndex": 2,
+      "phaseTitle": "Verify",
+      "agentId": "a4bb1d0ed866dbf18",
+      "model": "claude-opus-5-5",
+      "state": "done",
+      "startedAt": 1792873459023,
+      "queuedAt": 1792873459002,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "promptPreview": "You are reviewing an uncommitted change to vllm-lens (a vLLM plugin for activation capture, steering and hooks).\n- Modified working copy: /root/vllm-lens-fixed (run `git -C /root/vllm-lens-fixed diff` to see the full change vs upstream commit 3d11fb0).\n- Unmodified upstream for reference: /root/vllm-lens-upstream (same commit, read-only).\n- vLLM 0.30.0 source (the target version): /root/venvs/vlfi…",
+      "promptFramed": true,
+      "lastProgressAt": 1792873852148,
+      "tokens": 91811,
+      "toolCalls": 28,
+      "durationMs": 393122,
+      "resultPreview": "{\"verdicts\":[{\"title\":\"The forced-eager routing never fires, so decode steps of capturing requests replay a CUDA graph and their activations are silently dropped\",\"real\":false,\"severity\":\"critical\",\"reasoning\":\"This finding was written against an older copy of the file. _worker_ext.py was last changed at 20:11; exp_determine.py was written at 20:03. In the current code, _current_plan (lines 563-58…"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 8,
+      "label": "verify:steering",
+      "phaseIndex": 2,
+      "phaseTitle": "Verify",
+      "agentId": "a6081c014ec4cb034",
+      "model": "claude-opus-5-5",
+      "state": "done",
+      "startedAt": 1792873569805,
+      "queuedAt": 1792873569785,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "promptPreview": "You are reviewing an uncommitted change to vllm-lens (a vLLM plugin for activation capture, steering and hooks).\n- Modified working copy: /root/vllm-lens-fixed (run `git -C /root/vllm-lens-fixed diff` to see the full change vs upstream commit 3d11fb0).\n- Unmodified upstream for reference: /root/vllm-lens-upstream (same commit, read-only).\n- vLLM 0.30.0 source (the target version): /root/venvs/vlfi…",
+      "promptFramed": true,
+      "lastProgressAt": 1792873754992,
+      "tokens": 71999,
+      "toolCalls": 16,
+      "durationMs": 185185,
+      "resultPreview": "{\"verdicts\":[{\"title\":\"norm_match fast path computes L2 norms over a stacked (k, hidden) batch, so on CUDA its reduction order differs from upstream's per-token norms. Results are not bit-identical and depend on how many other steered rows share the pass.\",\"real\":true,\"severity\":\"minor\",\"reasoning\":\"Confirmed. In _steer_layer (/root/vllm-lens-fixed/vllm_lens/_worker_ext.py:849-853) the fast path t…"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 9,
+      "label": "verify:state",
+      "phaseIndex": 2,
+      "phaseTitle": "Verify",
+      "agentId": "a3e756ded37d3edc6",
+      "model": "claude-opus-5-5",
+      "state": "done",
+      "startedAt": 1792873770395,
+      "queuedAt": 1792873770381,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "promptPreview": "You are reviewing an uncommitted change to vllm-lens (a vLLM plugin for activation capture, steering and hooks).\n- Modified working copy: /root/vllm-lens-fixed (run `git -C /root/vllm-lens-fixed diff` to see the full change vs upstream commit 3d11fb0).\n- Unmodified upstream for reference: /root/vllm-lens-upstream (same commit, read-only).\n- vLLM 0.30.0 source (the target version): /root/venvs/vlfi…",
+      "promptFramed": true,
+      "lastProgressAt": 1792874061131,
+      "tokens": 80309,
+      "toolCalls": 18,
+      "durationMs": 290736,
+      "resultPreview": "{\"verdicts\":[{\"title\":\"One malformed output_residual_stream / output_qk value now crashes the engine: plan building in the dispatch wrapper has no exception guard\",\"real\":true,\"severity\":\"major\",\"reasoning\":\"Confirmed. I ran _parse_layer_request directly. Both '[[0]]' and [[0,1]] raise TypeError: unhashable type: 'list', because frozenset(value) is applied to the json.loads result with no validati…"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 10,
+      "label": "verify:hooks",
+      "phaseIndex": 2,
+      "phaseTitle": "Verify",
+      "agentId": "aff371618616916ad",
+      "model": "claude-opus-5-5",
+      "state": "done",
+      "startedAt": 1792874231791,
+      "queuedAt": 1792874231770,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "promptPreview": "You are reviewing an uncommitted change to vllm-lens (a vLLM plugin for activation capture, steering and hooks).\n- Modified working copy: /root/vllm-lens-fixed (run `git -C /root/vllm-lens-fixed diff` to see the full change vs upstream commit 3d11fb0).\n- Unmodified upstream for reference: /root/vllm-lens-upstream (same commit, read-only).\n- vLLM 0.30.0 source (the target version): /root/venvs/vlfi…",
+      "promptFramed": true,
+      "lastProgressAt": 1792874665818,
+      "tokens": 90078,
+      "toolCalls": 34,
+      "durationMs": 434025,
+      "resultPreview": "{\"verdicts\":[{\"title\":\"The determine() wrapper never sets force_eager, so hooked decode passes replay FULL CUDA graphs and no hooks run on them\",\"real\":false,\"severity\":\"critical\",\"reasoning\":\"This is already fixed in the current working copy. `_current_plan` (now about lines 586-604) no longer checks `is_forward_context_available()`; its comment says the dispatch wrapper plans the pass before vLL…"
+    }
+  ],
+  "totalTokens": 1368467,
+  "totalToolCalls": 407
+}

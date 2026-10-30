@@ -278,3 +278,29 @@ def deserialize_hook_results(
         hook_idx: {k: _deserialize_value(v) for k, v in saved.items()}
         for hook_idx, saved in raw.items()
     }
+
+
+# ---------------------------------------------------------------------------
+# In-process transport between worker and plugin
+# ---------------------------------------------------------------------------
+
+_PACKED = "__vllm_lens_packed_tensor__"
+
+
+def pack_tensor(tensor: torch.Tensor) -> tuple[str, str, tuple[int, ...], np.ndarray]:
+    """A picklable form of a CPU tensor that pickles at memory-copy speed.
+
+    Pickling a ``torch.Tensor`` serializes its storage through ``torch.save``
+    (a few milliseconds per tensor), which dominated batched activation
+    retrieval; a raw byte view of the same data pickles as one buffer.
+    """
+    t = tensor.detach().contiguous()
+    return (_PACKED, str(t.dtype).removeprefix("torch."), tuple(t.shape), t.view(torch.uint8).numpy())
+
+
+def unpack_tensor(value: Any) -> Any:
+    """Inverse of :func:`pack_tensor`; any other value is returned unchanged."""
+    if isinstance(value, tuple) and len(value) == 4 and value[0] == _PACKED:
+        _, dtype, shape, data = value
+        return torch.from_numpy(data).view(getattr(torch, dtype)).reshape(shape)
+    return value

@@ -58,9 +58,18 @@ results = client.collect_hook_results()
 client.clear_hooks()
 ```
 
-## Disabling the plugin
+## Execution mode and disabling the plugin
 
-vllm-lens auto-loads in **every** vLLM process (via the `vllm.general_plugins` entry point) and forces `enforce_eager=True` (disabling CUDA graphs) so its hooks can fire. To install it alongside another inference server without perturbing that server, set `VLLM_LENS_DISABLE=1` to make the plugin a complete no-op:
+vllm-lens auto-loads in **every** vLLM process (via the `vllm.general_plugins` entry point). Its hooks are plain PyTorch forward hooks, so they only run where the decoder layers execute uncompiled: the plugin turns torch.compile off (compilation mode `NONE`) and sets `cudagraph_mode=FULL_DECODE_ONLY`. CUDA graphs stay on for every forward pass that has no hook work; a pass in which any scheduled request needs steering, capture, hooks or Q/K runs eagerly, so every hook still fires on every token it applies to. Generation without lens requests (or after prompt-only interventions such as activation-oracle injection or `max_tokens=1` capture) therefore replays decode graphs instead of running eagerly.
+
+| Setting | Effect |
+| --- | --- |
+| default | torch.compile off, decode CUDA graphs for passes without hook work |
+| `VLLM_LENS_CUDA_GRAPHS=0` | force `enforce_eager=True` on every engine (the pre-1.4 behaviour) |
+| `enforce_eager=True` / `cudagraph_mode=NONE` | respected: always eager |
+| `VLLM_LENS_DISABLE=1` | the plugin is a complete no-op (vLLM's own defaults, including torch.compile) |
+
+To install it alongside another inference server without perturbing that server, use `VLLM_LENS_DISABLE=1`:
 
 ```bash
 VLLM_LENS_DISABLE=1 vllm serve meta-llama/Llama-3.1-8B-Instruct
@@ -225,7 +234,7 @@ outputs = llm.generate(["Hello world"], sp)
 print(outputs[0].hook_results)  # {"0": {"pre_L15": tensor, "pre_L16": tensor}}
 ```
 
-Pre-hooks run before the layer forward pass (useful for corrupting inputs):
+Pre-hooks run before the layer forward pass (useful for corrupting inputs). They see the residual stream entering the layer — the embeddings at layer 0, and on fused-residual layers after it `hidden_states + residual`, i.e. the same tensor the previous layer's post-hooks see — and a returned tensor replaces it. Return the new tensor rather than editing in place:
 
 ```python
 def corrupt_embeddings(ctx, h):

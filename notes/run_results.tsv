@@ -1,0 +1,82 @@
+fx_position_q25.log	RESULT {"check": "position_A_last_layer_pos0_with_decode", "expected_changed": [0], "changed": [0], "hits": {"0": {"norm_ratio": 0.9997, "cos": 1.0}}, "same_tokens": true, "ok": true}
+fx_position_q25.log	RESULT {"check": "position_B_generated_position", "n_prompt": 12, "first_changed": null, "hits": {}, "ok": false}
+prof/fx_eager.log	rep 0 total 0.233s rpc {'install_hooks': 0.001, 'get_captured_states_batch': 0.083} shape (3, 11, 896)
+prof/fx_eager.log	rep 1 total 0.206s rpc {'get_captured_states_batch': 0.073} shape (3, 11, 896)
+prof/fx_eager.log	rep 2 total 0.238s rpc {'get_captured_states_batch': 0.074} shape (3, 11, 896)
+prof/fx_eager.log	rep 3 total 0.198s rpc {'get_captured_states_batch': 0.072} shape (3, 11, 896)
+prof/fx_eager.log	stats {'passes_planned': 14, 'passes_active': 14, 'passes_forced_eager': 14, 'steered_layer_passes': 0, 'capture_copies': 42, 'hook_errors': 0, 'cuda_graphs': False, 'hooks_installed': True, 'qk_hooks_installed': False}
+prof/fx_graphs.log	rep 0 total 0.307s rpc {'install_hooks': 0.002, 'get_captured_states_batch': 0.088} shape (3, 11, 896)
+prof/fx_graphs.log	rep 1 total 0.280s rpc {'get_captured_states_batch': 0.082} shape (3, 11, 896)
+prof/fx_graphs.log	rep 2 total 0.243s rpc {'get_captured_states_batch': 0.062} shape (3, 11, 896)
+prof/fx_graphs.log	rep 3 total 0.239s rpc {'get_captured_states_batch': 0.064} shape (3, 11, 896)
+prof/fx_graphs.log	stats {'passes_planned': 20, 'passes_active': 20, 'passes_forced_eager': 20, 'steered_layer_passes': 0, 'capture_copies': 60, 'hook_errors': 0, 'cuda_graphs': True, 'hooks_installed': True, 'qk_hooks_installed': False}
+prof/q35_fx_eager.log	rep 0 total 5.932s rpc {'install_hooks': 0.06, 'get_captured_states_batch': 3.538} shape (3, 11, 1024)
+prof/q35_fx_eager.log	rep 1 total 3.859s rpc {'get_captured_states_batch': 2.344} shape (3, 11, 1024)
+prof/q35_fx_eager.log	rep 2 total 2.523s rpc {'get_captured_states_batch': 1.271} shape (3, 11, 1024)
+prof/q35_fx_eager.log	rep 3 total 3.505s rpc {'get_captured_states_batch': 1.869} shape (3, 11, 1024)
+prof/q35_fx_eager.log	stats {'passes_planned': 9, 'passes_active': 9, 'passes_forced_eager': 9, 'steered_layer_passes': 0, 'capture_copies': 27, 'hook_errors': 0, 'cuda_graphs': False, 'hooks_installed': True, 'qk_hooks_installed': False}
+prof/q35_fx_eager.log	nocap rep 0 total 0.781s
+prof/q35_fx_eager.log	nocap rep 1 total 0.265s
+prof/q35_fx_graphs.log	rep 0 total 3.105s rpc {'install_hooks': 0.036, 'get_captured_states_batch': 1.649} shape (3, 11, 1024)
+prof/q35_fx_graphs.log	rep 1 total 3.158s rpc {'get_captured_states_batch': 1.755} shape (3, 11, 1024)
+prof/q35_fx_graphs.log	rep 2 total 3.667s rpc {'get_captured_states_batch': 1.985} shape (3, 11, 1024)
+prof/q35_fx_graphs.log	rep 3 total 2.120s rpc {'get_captured_states_batch': 1.163} shape (3, 11, 1024)
+prof/q35_fx_graphs.log	stats {'passes_planned': 8, 'passes_active': 8, 'passes_forced_eager': 8, 'steered_layer_passes': 0, 'capture_copies': 24, 'hook_errors': 0, 'cuda_graphs': True, 'hooks_installed': True, 'qk_hooks_installed': False}
+prof/q35_fx_graphs.log	nocap rep 0 total 0.585s
+prof/q35_fx_graphs.log	nocap rep 1 total 0.232s
+prof/q35_up.log	rep 0 total 8.355s rpc {'install_hooks': 0.013, 'get_captured_states_batch': 4.488} shape (3, 11, 1024)
+prof/q35_up.log	rep 1 total 6.843s rpc {'get_captured_states_batch': 3.449} shape (3, 11, 1024)
+prof/q35_up.log	rep 2 total 5.712s rpc {'get_captured_states_batch': 2.594} shape (3, 11, 1024)
+prof/q35_up.log	rep 3 total 7.143s rpc {'get_captured_states_batch': 5.155} shape (3, 11, 1024)
+prof/q35_up.log	stats n/a Exception
+prof/q35_up.log	nocap rep 0 total 0.689s
+prof/q35_up.log	nocap rep 1 total 0.717s
+prof/up.log	rep 0 total 0.289s rpc {'install_hooks': 0.001, 'get_captured_states_batch': 0.1} shape (3, 11, 896)
+prof/up.log	rep 1 total 0.285s rpc {'get_captured_states_batch': 0.097} shape (3, 11, 896)
+prof/up.log	rep 2 total 0.233s rpc {'get_captured_states_batch': 0.073} shape (3, 11, 896)
+prof/up.log	rep 3 total 0.240s rpc {'get_captured_states_batch': 0.072} shape (3, 11, 896)
+prof/up.log	stats n/a Exception
+r2/fx_bench_q25.log	RESULT {"check": "bench", "case": "plain", "batch": 256, "new_tokens": 64, "best_s": 0.527, "all_s": [0.643, 0.538, 0.527], "stats": {"passes_planned": 0, "passes_active": 0, "passes_forced_eager": 0, "steered_layer_passes": 0, "capture_copies": 0, "hook_errors": 0, "cuda_graphs": true, "hooks_installed": false, "qk_hooks_installed": false}}
+r2/fx_bench_q25.log	RESULT {"check": "bench", "case": "plain_after_hooks_installed", "batch": 256, "new_tokens": 64, "best_s": 0.59, "all_s": [0.59, 0.6, 0.673], "stats": {"passes_planned": 205, "passes_active": 0, "passes_forced_eager": 0, "steered_layer_passes": 0, "capture_copies": 0, "hook_errors": 0, "cuda_graphs": true, "hooks_installed": true, "qk_hooks_installed": false}}
+r2/fx_bench_q25.log	RESULT {"check": "bench", "case": "steer_2d_per_request", "batch": 256, "new_tokens": 64, "best_s": 1.743, "all_s": [2.008, 1.743, 2.047], "stats": {"passes_planned": 202, "passes_active": 202, "passes_forced_eager": 202, "steered_layer_passes": 202, "capture_copies": 0, "hook_errors": 0, "cuda_graphs": true, "hooks_installed": true, "qk_hooks_installed": false}}
+r2/fx_bench_q25.log	RESULT {"check": "bench", "case": "steer_3d_prompt_position", "batch": 256, "new_tokens": 64, "best_s": 0.73, "all_s": [1.083, 0.845, 0.73], "stats": {"passes_planned": 201, "passes_active": 12, "passes_forced_eager": 12, "steered_layer_passes": 12, "capture_copies": 0, "hook_errors": 0, "cuda_graphs": true, "hooks_installed": true, "qk_hooks_installed": false}}
+r2/fx_bench_q25.log	RESULT {"check": "bench", "case": "capture_prefill_3_layers", "batch": 256, "new_tokens": 64, "best_s": 1.198, "all_s": [1.963, 1.339, 1.198], "stats": {"passes_planned": 10, "passes_active": 10, "passes_forced_eager": 10, "steered_layer_passes": 0, "capture_copies": 30, "hook_errors": 0, "cuda_graphs": true, "hooks_installed": true, "qk_hooks_installed": false}}
+r2/fx_bench_q25.log	RESULT {"check": "lens_stats", "stats": {"passes_planned": 0, "passes_active": 0, "passes_forced_eager": 0, "steered_layer_passes": 0, "capture_copies": 0, "hook_errors": 0, "cuda_graphs": true, "hooks_installed": true, "qk_hooks_installed": false}}
+r2/fx_bench_q35.log	RESULT {"check": "bench", "case": "plain", "batch": 256, "new_tokens": 64, "best_s": 1.249, "all_s": [1.466, 1.341, 1.249], "stats": {"passes_planned": 0, "passes_active": 0, "passes_forced_eager": 0, "steered_layer_passes": 0, "capture_copies": 0, "hook_errors": 0, "cuda_graphs": true, "hooks_installed": false, "qk_hooks_installed": false}}
+r2/fx_bench_q35.log	RESULT {"check": "bench", "case": "plain_after_hooks_installed", "batch": 256, "new_tokens": 64, "best_s": 1.022, "all_s": [1.161, 1.171, 1.022], "stats": {"passes_planned": 195, "passes_active": 0, "passes_forced_eager": 0, "steered_layer_passes": 0, "capture_copies": 0, "hook_errors": 0, "cuda_graphs": true, "hooks_installed": true, "qk_hooks_installed": false}}
+r2/fx_bench_q35.log	RESULT {"check": "bench", "case": "steer_2d_per_request", "batch": 256, "new_tokens": 64, "best_s": 4.639, "all_s": [4.639, 4.693, 5.167], "stats": {"passes_planned": 195, "passes_active": 195, "passes_forced_eager": 195, "steered_layer_passes": 195, "capture_copies": 0, "hook_errors": 0, "cuda_graphs": true, "hooks_installed": true, "qk_hooks_installed": false}}
+r2/fx_bench_q35.log	RESULT {"check": "bench", "case": "steer_3d_prompt_position", "batch": 256, "new_tokens": 64, "best_s": 1.518, "all_s": [1.518, 2.354, 2.521], "stats": {"passes_planned": 195, "passes_active": 6, "passes_forced_eager": 6, "steered_layer_passes": 6, "capture_copies": 0, "hook_errors": 0, "cuda_graphs": true, "hooks_installed": true, "qk_hooks_installed": false}}
+r2/fx_bench_q35.log	RESULT {"check": "bench", "case": "capture_prefill_3_layers", "batch": 256, "new_tokens": 64, "best_s": 3.677, "all_s": [3.677, 3.819, 4.271], "stats": {"passes_planned": 6, "passes_active": 6, "passes_forced_eager": 6, "steered_layer_passes": 0, "capture_copies": 18, "hook_errors": 0, "cuda_graphs": true, "hooks_installed": true, "qk_hooks_installed": false}}
+r2/fx_bench_q35.log	RESULT {"check": "lens_stats", "stats": {"passes_planned": 0, "passes_active": 0, "passes_forced_eager": 0, "steered_layer_passes": 0, "capture_copies": 0, "hook_errors": 0, "cuda_graphs": true, "hooks_installed": true, "qk_hooks_installed": false}}
+r2/fx_chunked_q25.log	RESULT {"check": "position_C_chunked_prefill", "n_prompt": 187, "chunk": 64, "results": {"10": {"changed": [10], "hits": {"10": {"norm_ratio": 0.9999, "cos": 1.0}}, "ok": true}, "74": {"changed": [74], "hits": {"74": {"norm_ratio": 1.0, "cos": 1.0}}, "ok": true}, "138": {"changed": [138], "hits": {"138": {"norm_ratio": 1.0, "cos": 1.0}}, "ok": true}}, "ok": true}
+r2/fx_chunked_q25.log	RESULT {"check": "lens_stats", "stats": {"passes_planned": 12, "passes_active": 12, "passes_forced_eager": 12, "steered_layer_passes": 3, "capture_copies": 12, "hook_errors": 0, "cuda_graphs": true, "hooks_installed": true, "qk_hooks_installed": false}}
+r2/fx_parity_q35.log	RESULT {"check": "parity_vs_hf", "layers": [0, 12, 22], "min_cos": {"0": 0.999957, "12": 0.999064, "22": 0.999279}, "ok": true}
+r2/fx_suite_q25.log	RESULT {"check": "position_A_last_layer_pos0_with_decode", "captured_rows": 19, "expected_rows": 19, "changed": [0], "hits": {"0": {"norm_ratio": 0.9997, "cos": 1.0}}, "same_tokens": true, "ok": true}
+r2/fx_suite_q25.log	RESULT {"check": "position_B_generated_position", "target": 14, "captured_rows": 19, "first_changed": 14, "hits": {"14": {"norm_ratio": 1.0001, "cos": 1.0}}, "ok": true}
+r2/fx_suite_q25.log	RESULT {"check": "prehook", "calls_layer0_4_tokens": 4, "zeroing_changes_capture": true, "pre_at_L_equals_post_at_L_minus_1": true, "ok": true}
+r2/fx_suite_q25.log	RESULT {"check": "lens_stats", "stats": {"passes_planned": 41, "passes_active": 41, "passes_forced_eager": 41, "steered_layer_passes": 2, "capture_copies": 40, "hook_errors": 0, "cuda_graphs": true, "hooks_installed": true, "qk_hooks_installed": false}}
+r2/fx_suite_q25.log	RESULT {"check": "parity_vs_hf", "layers": [0, 12, 22], "min_cos": {"0": 0.999979, "12": 0.999798, "22": 0.999185}, "ok": true}
+r2/fx_suite_q35.log	RESULT {"check": "position_A_last_layer_pos0_with_decode", "captured_rows": 19, "expected_rows": 19, "changed": [0], "hits": {"0": {"norm_ratio": 1.0001, "cos": 1.0}}, "same_tokens": true, "ok": true}
+r2/fx_suite_q35.log	RESULT {"check": "position_B_generated_position", "target": 14, "captured_rows": 19, "first_changed": 14, "hits": {"14": {"norm_ratio": 1.0001, "cos": 1.0}}, "ok": true}
+r2/fx_suite_q35.log	RESULT {"check": "prehook", "calls_layer0_4_tokens": 4, "zeroing_changes_capture": true, "pre_at_L_equals_post_at_L_minus_1": true, "ok": true}
+r2/fx_suite_q35.log	RESULT {"check": "lens_stats", "stats": {"passes_planned": 40, "passes_active": 40, "passes_forced_eager": 40, "steered_layer_passes": 2, "capture_copies": 37, "hook_errors": 0, "cuda_graphs": true, "hooks_installed": true, "qk_hooks_installed": false}}
+r2/up_bench_q25.log	RESULT {"check": "bench", "case": "plain", "batch": 256, "new_tokens": 64, "best_s": 1.472, "all_s": [1.898, 1.472, 1.622], "stats": {"unavailable": "Exception"}}
+r2/up_bench_q25.log	RESULT {"check": "bench", "case": "plain_after_hooks_installed", "batch": 256, "new_tokens": 64, "best_s": 1.698, "all_s": [2.869, 1.898, 1.698], "stats": {"unavailable": "Exception"}}
+r2/up_bench_q25.log	RESULT {"check": "bench", "case": "steer_2d_per_request", "batch": 256, "new_tokens": 64, "best_s": 22.339, "all_s": [24.895, 22.475, 22.339], "stats": {"unavailable": "Exception"}}
+r2/up_bench_q25.log	RESULT {"check": "bench", "case": "steer_3d_prompt_position", "batch": 256, "new_tokens": 64, "best_s": 21.874, "all_s": [22.239, 22.053, 21.874], "stats": {"unavailable": "Exception"}}
+r2/up_bench_q25.log	RESULT {"check": "bench", "case": "capture_prefill_3_layers", "batch": 256, "new_tokens": 64, "best_s": 0.328, "all_s": [0.689, 0.596, 0.328], "stats": {"unavailable": "Exception"}}
+r2/up_bench_q25.log	RESULT {"check": "lens_stats", "stats": {"unavailable": "Exception"}}
+r2/up_bench_q35.log	RESULT {"check": "bench", "case": "plain", "batch": 256, "new_tokens": 64, "best_s": 5.804, "all_s": [6.567, 6.94, 5.804], "stats": {"unavailable": "Exception"}}
+r2/up_bench_q35.log	RESULT {"check": "bench", "case": "plain_after_hooks_installed", "batch": 256, "new_tokens": 64, "best_s": 8.616, "all_s": [8.616, 8.826, 10.099], "stats": {"unavailable": "Exception"}}
+r2/up_bench_q35.log	RESULT {"check": "bench", "case": "steer_2d_per_request", "batch": 256, "new_tokens": 64, "best_s": 27.927, "all_s": [30.881, 29.276, 27.927], "stats": {"unavailable": "Exception"}}
+r2/up_bench_q35.log	RESULT {"check": "bench", "case": "steer_3d_prompt_position", "batch": 256, "new_tokens": 64, "best_s": 25.237, "all_s": [26.929, 26.34, 25.237], "stats": {"unavailable": "Exception"}}
+r2/up_bench_q35.log	RESULT {"check": "bench", "case": "capture_prefill_3_layers", "batch": 256, "new_tokens": 64, "best_s": 1.699, "all_s": [4.029, 2.852, 1.699], "stats": {"unavailable": "Exception"}}
+r2/up_bench_q35.log	RESULT {"check": "lens_stats", "stats": {"unavailable": "Exception"}}
+r2/up_chunked_q25.log	RESULT {"check": "position_C_chunked_prefill", "n_prompt": 187, "chunk": 64, "results": {"10": {"changed": [10, 74, 138], "hits": {"10": {"norm_ratio": 0.9999, "cos": 1.0}}, "ok": false}, "74": {"changed": [], "hits": {"74": {"norm_ratio": 0.0, "cos": 0.0}}, "ok": false}, "138": {"changed": [], "hits": {"138": {"norm_ratio": 0.0, "cos": 0.0}}, "ok": false}}, "ok": false}
+r2/up_chunked_q25.log	RESULT {"check": "lens_stats", "stats": {"unavailable": "Exception"}}
+r2/up_suite_q35.log	RESULT {"check": "position_A_last_layer_pos0_with_decode", "captured_rows": 19, "expected_rows": 19, "changed": [0, 12, 13, 14, 15, 16, 17, 18], "hits": {"0": {"norm_ratio": 1.0001, "cos": 1.0}}, "same_tokens": false, "ok": false}
+r2/up_suite_q35.log	RESULT {"check": "position_B_generated_position", "target": 14, "captured_rows": 19, "first_changed": null, "hits": {"14": {"norm_ratio": 0.0, "cos": 0.0}}, "ok": false}
+r2/up_suite_q35.log	RESULT {"check": "prehook", "calls_layer0_4_tokens": null, "zeroing_changes_capture": false, "pre_at_L_equals_post_at_L_minus_1": null, "ok": false}
+r2/up_suite_q35.log	RESULT {"check": "lens_stats", "stats": {"unavailable": "Exception"}}
+up_position_q25.log	RESULT {"check": "position_A_last_layer_pos0_with_decode", "expected_changed": [0], "changed": [0, 12, 13, 14, 15, 16, 17, 18], "hits": {"0": {"norm_ratio": 0.9997, "cos": 1.0}}, "same_tokens": false, "ok": false}
+up_position_q25.log	RESULT {"check": "position_B_generated_position", "n_prompt": 12, "first_changed": null, "hits": {"12": {"norm_ratio": 0.0, "cos": 0.0}}, "ok": false}
